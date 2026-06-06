@@ -36,7 +36,7 @@ os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist
     AWAIT_DELETEROW_NAME,
     AWAIT_RENAMEROW_OLD, AWAIT_RENAMEROW_NEW,
     AWAIT_INSERTROW_NAME, AWAIT_INSERTROW_POS, AWAIT_INSERTROW_BARCODE,
-) = range(23)
+) = range(25)
 
 # ==========================
 # DATABASE
