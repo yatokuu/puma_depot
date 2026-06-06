@@ -411,6 +411,13 @@ async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query    = update.message.text.strip()
     store_id = context.user_data.get("store_id")
+    if not store_id:
+        store_id, role = user_store(update.effective_user.id)
+        if not store_id:
+            await update.message.reply_text("❌ Session lost. Please tap 🔍 Search again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
 
     rows = cur.execute(
         """
@@ -596,6 +603,15 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAIT_ADD_BARCODE
 
 async def add_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Recover store_id if user_data was wiped (e.g. bot restart)
+    if "store_id" not in context.user_data:
+        store_id, role = user_store(update.effective_user.id)
+        if not store_id:
+            await update.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
+
     context.user_data["new_barcode"] = update.message.text.strip()
     rows = cur.execute(
         "SELECT DISTINCT row_name FROM inventory WHERE store_id=? ORDER BY row_name",
@@ -615,6 +631,14 @@ async def add_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_row_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Recover store_id if lost
+    if "store_id" not in context.user_data:
+        store_id, role = user_store(query.from_user.id)
+        if not store_id:
+            await query.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
     if query.data == "row:__new__":
         await query.message.reply_text("✏️ Type the new row name:")
         return AWAIT_ADD_ROW
@@ -676,6 +700,13 @@ async def photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def photo_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     barcode  = update.message.text.strip()
+    if "store_id" not in context.user_data:
+        store_id, role = user_store(update.effective_user.id)
+        if not store_id:
+            await update.message.reply_text("❌ Session lost. Please tap 📷 Add photo again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
     store_id = context.user_data["store_id"]
 
     exists = cur.execute(
@@ -737,6 +768,13 @@ async def move_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def move_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     barcode  = update.message.text.strip()
+    if "store_id" not in context.user_data:
+        store_id, role = user_store(update.effective_user.id)
+        if not store_id:
+            await update.message.reply_text("❌ Session lost. Please tap 🔀 Move product again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
     store_id = context.user_data["store_id"]
 
     rows = cur.execute(
@@ -801,6 +839,13 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def delete_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     barcode  = update.message.text.strip()
+    if "store_id" not in context.user_data:
+        store_id, role = user_store(update.effective_user.id)
+        if not store_id:
+            await update.message.reply_text("❌ Session lost. Please tap 🗑 Delete item again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
     store_id = context.user_data["store_id"]
 
     rows = cur.execute(
@@ -1537,6 +1582,21 @@ app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND,
     keyboard_router
 ))
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    err = ''.join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    print(f"ERROR: {err}")
+    # Notify user so they don't sit confused
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong. Please tap the button again to retry."
+            )
+        except Exception:
+            pass
+
+app.add_error_handler(error_handler)
 
 print("Puma Depot Bot running...")
 app.run_polling()
