@@ -599,11 +599,15 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data["store_id"] = store_id
     context.user_data["role"]     = role
-    await update.message.reply_text("➕ Barcode of the new item:")
+    context.user_data.pop("new_barcode", None)
+    context.user_data.pop("new_shelf", None)
+    await update.message.reply_text(
+        "➕ *Step 1/3* — Enter the barcode:",
+        parse_mode="Markdown"
+    )
     return AWAIT_ADD_BARCODE
 
 async def add_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Recover store_id if user_data was wiped (e.g. bot restart)
     if "store_id" not in context.user_data:
         store_id, role = user_store(update.effective_user.id)
         if not store_id:
@@ -613,76 +617,80 @@ async def add_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["role"] = role
 
     context.user_data["new_barcode"] = update.message.text.strip()
-    rows = cur.execute(
-        "SELECT DISTINCT row_name FROM inventory WHERE store_id=? ORDER BY row_name",
-        (context.user_data["store_id"],)
-    ).fetchall()
-    if rows:
-        buttons = [[InlineKeyboardButton(r["row_name"], callback_data=f"row:{r['row_name']}")] for r in rows]
-        buttons.append([InlineKeyboardButton("✏️ Type new row name", callback_data="row:__new__")])
-        await update.message.reply_text(
-            "📋 Select a row or type a new one:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await update.message.reply_text("📋 Row name (e.g. `Новая_коллекция_1ряд`):", parse_mode="Markdown")
+    await update.message.reply_text(
+        "📦 *Step 2/3* — Shelf / row name\n(e.g. Новая_коллекция_1ряд):",
+        parse_mode="Markdown"
+    )
     return AWAIT_ADD_ROW
 
 async def add_row_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    # Recover store_id if lost
+    """Unused but kept so the handler registration does not break."""
+    pass
+
+async def add_row_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "store_id" not in context.user_data:
-        store_id, role = user_store(query.from_user.id)
+        store_id, role = user_store(update.effective_user.id)
         if not store_id:
-            await query.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
+            await update.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
             return ConversationHandler.END
         context.user_data["store_id"] = store_id
         context.user_data["role"] = role
-    if query.data == "row:__new__":
-        await query.message.reply_text("✏️ Type the new row name:")
-        return AWAIT_ADD_ROW
-    row_name = query.data.split(":", 1)[1]
-    context.user_data["new_row"] = row_name
-    await query.message.reply_text(f"📦 Box / position number in *{row_name}*:", parse_mode="Markdown")
-    return AWAIT_ADD_POSITION
 
-async def add_row_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"] = update.message.text.strip()
-    await update.message.reply_text(f"📦 Box / position number:")
+    context.user_data["new_shelf"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🔢 *Step 3/3* — Box number / index:",
+        parse_mode="Markdown"
+    )
     return AWAIT_ADD_POSITION
 
 async def add_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "store_id" not in context.user_data:
+        store_id, role = user_store(update.effective_user.id)
+        if not store_id:
+            await update.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
+            return ConversationHandler.END
+        context.user_data["store_id"] = store_id
+        context.user_data["role"] = role
+
     try:
         position = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Position must be a number. Try again:")
+        await update.message.reply_text("❌ Box number must be a number. Try again:")
         return AWAIT_ADD_POSITION
 
     store_id = context.user_data["store_id"]
-    barcode  = context.user_data["new_barcode"]
-    row_name = context.user_data["new_row"]
+    barcode  = context.user_data.get("new_barcode", "")
+    shelf    = context.user_data.get("new_shelf", "")
     tg_id    = update.effective_user.id
+
+    if not barcode or not shelf:
+        await update.message.reply_text("❌ Something went wrong. Please tap ➕ Add item and start again.")
+        return ConversationHandler.END
 
     try:
         cur.execute(
             "INSERT INTO inventory (store_id, barcode, row_name, position) VALUES (?,?,?,?)",
-            (store_id, barcode, row_name, position)
+            (store_id, barcode, shelf, position)
         )
         conn.commit()
-        log(store_id, tg_id, "add", f"{barcode} → {row_name} pos {position}")
+        log(store_id, tg_id, "add", f"{barcode} -> {shelf} box {position}")
         await update.message.reply_text(
-            f"✅ Added `{barcode}` → *{row_name}*, box {position}\n\n"
-            f"💡 Tap *📷 Add photo* to attach a product photo.",
+            f"✅ Saved!\n\n"
+            f"📦 Barcode: `{barcode}`\n"
+            f"📍 Shelf: *{shelf}*\n"
+            f"🔢 Box: *{position}*\n\n"
+            "💡 Tap 📷 Add photo to attach a product photo.",
             parse_mode="Markdown",
             reply_markup=main_menu(context.user_data.get("role", "worker"))
         )
     except sqlite3.IntegrityError:
         await update.message.reply_text(
-            f"⚠️ `{barcode}` already exists at *{row_name}*, box {position}.",
+            f"⚠️ `{barcode}` already exists at *{shelf}*, box {position}.",
             parse_mode="Markdown",
             reply_markup=main_menu(context.user_data.get("role", "worker"))
         )
+    context.user_data.pop("new_barcode", None)
+    context.user_data.pop("new_shelf", None)
     return ConversationHandler.END
 
 # ==========================
@@ -1520,10 +1528,7 @@ app.add_handler(build_conv(
     entry_points=[CommandHandler("add", add_start)],
     states={
         AWAIT_ADD_BARCODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_barcode)],
-        AWAIT_ADD_ROW:      [
-            CallbackQueryHandler(add_row_callback, pattern=r"^row:"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, add_row_text),
-        ],
+        AWAIT_ADD_ROW:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_row_text)],
         AWAIT_ADD_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_position)],
     },
     name="add"
