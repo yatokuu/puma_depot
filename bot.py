@@ -1437,20 +1437,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================
 
 async def keyboard_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route persistent keyboard button taps to the right conversation."""
+    """Handle non-conversation keyboard buttons. Conversation buttons are entry points directly."""
     text = update.message.text
-    if text == "🔍 Search":
-        return await search_start(update, context)
-    if text == "➕ Add item":
-        return await add_start(update, context)
-    if text == "🔀 Move product":
-        return await move_start(update, context)
-    if text == "📷 Add photo":
-        return await photo_start(update, context)
-    if text == "🗑 Delete item":
-        return await delete_start(update, context)
-    if text == "📦 Manage rows":
-        return await rowmgr_start(update, context)
     if text == "📊 Audit log":
         return await audit(update, context)
     if text == "⚠️ Low stock":
@@ -1485,7 +1473,6 @@ async def button_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def build_conv(entry_points, states, name):
-    # Add every main button as a fallback so tapping them always works
     button_fallbacks = [
         MessageHandler(filters.Regex(f"^{re.escape(t)}$"), button_fallback)
         for t in BUTTON_TEXTS
@@ -1496,7 +1483,7 @@ def build_conv(entry_points, states, name):
         fallbacks=[CommandHandler("cancel", cancel)] + button_fallbacks,
         name=name,
         per_user=True,
-        per_chat=True,
+        per_chat=False,  # per-user only so each person has their own state
         allow_reentry=True,
     )
 
@@ -1518,14 +1505,20 @@ app.add_handler(CallbackQueryHandler(delete_confirm_callback, pattern=r"^(delrow
 app.add_handler(CallbackQueryHandler(confirmdelrow_callback,  pattern=r"^confirmdelrow:"))
 app.add_handler(CallbackQueryHandler(canceldelrow_callback,   pattern=r"^canceldelrow$"))
 
-# Conversations
+# Conversations — entry points include BOTH commands AND keyboard button texts
 app.add_handler(build_conv(
-    entry_points=[CommandHandler("search", search_start)],
+    entry_points=[
+        CommandHandler("search", search_start),
+        MessageHandler(filters.Regex(r"^🔍 Search$"), search_start),
+    ],
     states={AWAIT_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_execute)]},
     name="search"
 ))
 app.add_handler(build_conv(
-    entry_points=[CommandHandler("add", add_start)],
+    entry_points=[
+        CommandHandler("add", add_start),
+        MessageHandler(filters.Regex(r"^➕ Add item$"), add_start),
+    ],
     states={
         AWAIT_ADD_BARCODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_barcode)],
         AWAIT_ADD_ROW:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_row_text)],
@@ -1534,7 +1527,10 @@ app.add_handler(build_conv(
     name="add"
 ))
 app.add_handler(build_conv(
-    entry_points=[CommandHandler("addphoto", photo_start)],
+    entry_points=[
+        CommandHandler("addphoto", photo_start),
+        MessageHandler(filters.Regex(r"^📷 Add photo$"), photo_start),
+    ],
     states={
         AWAIT_PHOTO_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_barcode)],
         AWAIT_PHOTO_IMG:     [MessageHandler(filters.PHOTO, photo_receive)],
@@ -1542,7 +1538,10 @@ app.add_handler(build_conv(
     name="photo"
 ))
 app.add_handler(build_conv(
-    entry_points=[CommandHandler("move", move_start)],
+    entry_points=[
+        CommandHandler("move", move_start),
+        MessageHandler(filters.Regex(r"^🔀 Move product$"), move_start),
+    ],
     states={
         AWAIT_MOVE_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_barcode)],
         AWAIT_MOVE_ROW:     [MessageHandler(filters.TEXT & ~filters.COMMAND, move_row)],
@@ -1551,7 +1550,10 @@ app.add_handler(build_conv(
     name="move"
 ))
 app.add_handler(build_conv(
-    entry_points=[CommandHandler("delete", delete_start)],
+    entry_points=[
+        CommandHandler("delete", delete_start),
+        MessageHandler(filters.Regex(r"^🗑 Delete item$"), delete_start),
+    ],
     states={
         AWAIT_DELETE_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_barcode)],
     },
@@ -1560,7 +1562,10 @@ app.add_handler(build_conv(
 
 # Row management conversation
 app.add_handler(build_conv(
-    entry_points=[CommandHandler("rows", rowmgr_start)],
+    entry_points=[
+        CommandHandler("rows", rowmgr_start),
+        MessageHandler(filters.Regex(r"^📦 Manage rows$"), rowmgr_start),
+    ],
     states={
         AWAIT_ROW_ACTION:      [CallbackQueryHandler(rowmgr_action,    pattern=r"^rowmgr:")],
         AWAIT_SHOWROW_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, showrow_name)],
