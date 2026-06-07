@@ -129,7 +129,8 @@ def menu(role):
         [KeyboardButton("🔍 Search"),       KeyboardButton("➕ Add item")],
         [KeyboardButton("🔀 Move"),          KeyboardButton("📷 Add photo")],
         [KeyboardButton("🗑 Delete"),        KeyboardButton("📦 Rows")],
-        [KeyboardButton("ℹ️ Help")],
+        [KeyboardButton("📈 Status"),        KeyboardButton("📋 Feed")],
+        [KeyboardButton("🏆 My stats"),      KeyboardButton("ℹ️ Help")],
     ]
     if role in ("manager", "admin"):
         base.append([KeyboardButton("📊 Audit"), KeyboardButton("⚠️ Low stock")])
@@ -171,13 +172,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP = (
     "👟 *Puma Depot Bot*\n\n"
     "*🔍 Search* — find by barcode (partial OK)\n"
-    "*➕ Add item* — add barcode → shelf → box\n"
+    "*➕ Add item* — barcode → shelf → box number\n"
     "*🔀 Move* — change item location\n"
     "*📷 Add photo* — attach photo to barcode\n"
     "*🗑 Delete* — remove an item\n"
-    "*📦 Rows* — manage shelves/rows\n\n"
-    "After searching, tap result buttons:\n"
-    "➖ Sold  ➕ Restock  🔀 Move  🗑 Delete\n\n"
+    "*📦 Rows* — manage shelves and rows\n"
+    "*📈 Status* — live warehouse snapshot\n"
+    "*📋 Feed* — today\'s activity by the team\n"
+    "*🏆 My stats* — your personal weekly stats\n\n"
+    "After finding an item, tap:\n"
+    "  ➖ Sold · ➕ Restock · 🔀 Move · 🗑 Delete\n\n"
     "Manager: 📊 Audit · ⚠️ Low stock · /promote · /members\n"
     "Admin: /newstore · /liststores"
 )
@@ -954,6 +958,146 @@ async def cmd_lowstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• `{r['barcode']}` — {r['shelf']} box {r['box']} — *{r['quantity']}* left\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
+# ==========================
+# /status — warehouse snapshot
+# ==========================
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = get_user_store(update.effective_user.id)
+    if not store_id:
+        await update.message.reply_text("❌ Join a store first.")
+        return
+    store = get_store(store_id)
+    total = cur.execute("SELECT COUNT(*) FROM inventory WHERE store_id=?", (store_id,)).fetchone()[0]
+    shelves = cur.execute("SELECT COUNT(DISTINCT shelf) FROM inventory WHERE store_id=?", (store_id,)).fetchone()[0]
+    low = cur.execute("SELECT COUNT(*) FROM inventory WHERE store_id=? AND quantity<=2", (store_id,)).fetchone()[0]
+    today = cur.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE store_id=? AND action='add' AND DATE(ts)=DATE('now')",
+        (store_id,)
+    ).fetchone()[0]
+    photos = cur.execute("SELECT COUNT(*) FROM photos WHERE store_id=?", (store_id,)).fetchone()[0]
+
+    low_icon = "🔴" if low > 0 else "✅"
+    sep = '─' * 28
+    text = (
+        f"🏪 *{store['name']}* — snapshot\n"
+        f"{sep}\n"
+        f"📦 Total items:   *{total}*\n"
+        f"🗂 Shelves:        *{shelves}*\n"
+        f"📷 Photos:         *{photos}*\n"
+        f"➕ Added today:   *{today}*\n"
+        f"{low_icon} Low stock:     *{low}* item(s)\n"
+        f"{sep}\n"
+    )
+    if low > 0:
+        low_items = cur.execute(
+            "SELECT barcode, shelf, box, quantity FROM inventory "
+            "WHERE store_id=? AND quantity<=2 ORDER BY quantity LIMIT 5",
+            (store_id,)
+        ).fetchall()
+        text += "⚠️ *Needs restocking:*\n"
+        for r in low_items:
+            dots = "🔴" if r["quantity"] <= 1 else "🟡"
+            dots = "🔴" if r["quantity"] <= 1 else "🟡"
+            text += f"  {dots} `{r['barcode']}` — {r['shelf']} box {r['box']} — *{r['quantity']}* left\n"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=menu(role))
+
+# ==========================
+# /feed — today's activity
+# ==========================
+
+async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = get_user_store(update.effective_user.id)
+    if not store_id:
+        await update.message.reply_text("❌ Join a store first.")
+        return
+    rows = cur.execute(
+        """
+        SELECT a.action, a.detail, a.tg_id, a.ts, u.name
+        FROM audit_log a
+        LEFT JOIN users u ON u.tg_id=a.tg_id AND u.store_id=a.store_id
+        WHERE a.store_id=? AND DATE(a.ts)=DATE('now')
+        ORDER BY a.id DESC LIMIT 15
+        """,
+        (store_id,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text(
+            "📭 No activity today yet.\n\nBe the first — tap ➕ Add item!",
+            reply_markup=menu(role)
+        )
+        return
+    icons = {"add":"➕","sold":"💸","restock":"📦","move":"🔀",
+             "photo":"📷","delone":"🗑","delall":"🗑","join":"👤",
+             "addrow":"📋","append":"📎","insert":"📌","rename":"✏️","delshelf":"🗑"}
+    store = get_store(store_id)
+    text = f"📋 *{store['name']} — today's activity*\n\n"
+    for r in rows:
+        icon   = icons.get(r["action"], "•")
+        name   = r["name"] or f"User {r['tg_id']}"
+        time   = r["ts"][11:16] if r["ts"] else ""
+        detail = r["detail"] or ""
+        text  += f"{icon} *{name}* — {r['action']} {detail} `{time}`\n"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=menu(role))
+
+# ==========================
+# /mystats — personal stats
+# ==========================
+
+async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id    = update.effective_user.id
+    store_id, role = get_user_store(tg_id)
+    if not store_id:
+        await update.message.reply_text("❌ Join a store first.")
+        return
+    name = update.effective_user.first_name or "You"
+
+    def count(action, days):
+        return cur.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE store_id=? AND tg_id=? AND action=? "
+            "AND ts >= datetime('now', ?)",
+            (store_id, tg_id, action, f"-{days} days")
+        ).fetchone()[0]
+
+    added_week  = count("add",     7)
+    added_month = count("add",    30)
+    sold_week   = count("sold",    7)
+    moved_week  = count("move",    7)
+    photos_week = count("photo",   7)
+    total_actions = cur.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE store_id=? AND tg_id=?",
+        (store_id, tg_id)
+    ).fetchone()[0]
+
+    # rank among store members
+    rank_rows = cur.execute(
+        "SELECT tg_id, COUNT(*) as c FROM audit_log WHERE store_id=? "
+        "AND ts >= datetime('now', '-7 days') GROUP BY tg_id ORDER BY c DESC",
+        (store_id,)
+    ).fetchall()
+    rank = next((i+1 for i, r in enumerate(rank_rows) if r["tg_id"] == tg_id), "-")
+    medals = {1:"🥇",2:"🥈",3:"🥉"}
+    medal  = medals.get(rank, f"#{rank}")
+
+    sep = '─' * 26
+    text = (
+        f"📊 *{name}'s stats*\n"
+        f"{sep}\n"
+        "*This week:*\n"
+        f"  ➕ Added:   *{added_week}* items\n"
+        f"  💸 Sold:     *{sold_week}* times\n"
+        f"  🔀 Moved:  *{moved_week}* items\n"
+        f"  📷 Photos: *{photos_week}* added\n\n"
+        "*This month:*\n"
+        f"  ➕ Added:   *{added_month}* items\n\n"
+        "*All time:*\n"
+        f"  🏆 Actions: *{total_actions}* total\n"
+        f"  {medal} Store rank this week\n"
+        f"{sep}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=menu(role))
+
 # ==========================
 # ERROR HANDLER
 # ==========================
@@ -978,6 +1122,9 @@ async def keyboard_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📊 Audit":     return await cmd_audit(update, context)
     if text == "⚠️ Low stock": return await cmd_lowstock(update, context)
     if text == "ℹ️ Help":      return await cmd_help(update, context)
+    if text == "📈 Status":    return await cmd_status(update, context)
+    if text == "📋 Feed":      return await cmd_feed(update, context)
+    if text == "🏆 My stats":  return await cmd_mystats(update, context)
 
 # ==========================
 # BUILD APP
@@ -992,7 +1139,7 @@ def make_conv(name, entry_text, entry_fn, states):
         ],
         states=states,
         fallbacks=ENTRY_CANCEL + [
-            MessageHandler(filters.Regex(r"^(🔍 Search|➕ Add item|🔀 Move|📷 Add photo|🗑 Delete|📦 Rows|ℹ️ Help|📊 Audit|⚠️ Low stock)$"), cancel)
+            MessageHandler(filters.Regex(r"^(🔍 Search|➕ Add item|🔀 Move|📷 Add photo|🗑 Delete|📦 Rows|ℹ️ Help|📊 Audit|⚠️ Low stock|📈 Status|📋 Feed|🏆 My stats)$"), cancel)
         ],
         name=name,
         per_user=True,
@@ -1010,6 +1157,12 @@ app.add_handler(CommandHandler("liststores", cmd_liststores))
 app.add_handler(CommandHandler("join",       cmd_join))
 app.add_handler(CommandHandler("promote",    cmd_promote))
 app.add_handler(CommandHandler("members",    cmd_members))
+app.add_handler(CommandHandler("status",     cmd_status))
+app.add_handler(CommandHandler("feed",       cmd_feed))
+app.add_handler(CommandHandler("mystats",    cmd_mystats))
+app.add_handler(CommandHandler("status",     cmd_status))
+app.add_handler(CommandHandler("feed",       cmd_feed))
+app.add_handler(CommandHandler("mystats",    cmd_mystats))
 
 # Inline callbacks
 app.add_handler(CallbackQueryHandler(cb_view,             pattern=r"^view:"))
