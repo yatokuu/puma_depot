@@ -2,7 +2,15 @@ import os
 import re
 import sqlite3
 import hashlib
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler,
@@ -13,30 +21,34 @@ from telegram.ext import (
 # ==========================
 
 TOKEN    = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])   # your Telegram user ID
-
-DB_PATH = os.environ.get("DB_PATH", "inventory.db")
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+DB_PATH  = os.environ.get("DB_PATH", "inventory.db")
 os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
 
-# ConversationHandler states
+# ==========================
+# STATES  (one flat enum)
+# ==========================
+
 (
-    AWAIT_STORE_NAME,
-    AWAIT_JOIN_CODE,
-    AWAIT_SEARCH,
-    AWAIT_ADD_BARCODE, AWAIT_ADD_ROW, AWAIT_ADD_POSITION,
-    AWAIT_PHOTO_BARCODE, AWAIT_PHOTO_IMG,
-    AWAIT_MOVE_BARCODE, AWAIT_MOVE_ROW, AWAIT_MOVE_POS,
-    AWAIT_DELETE_BARCODE,
-    AWAIT_APPROVE_TARGET,
-    # Row management
-    AWAIT_ROW_ACTION,
-    AWAIT_ADDROW_NAME, AWAIT_ADDROW_ITEMS,
-    AWAIT_APPENDROW_NAME, AWAIT_APPENDROW_ITEMS,
-    AWAIT_SHOWROW_NAME,
-    AWAIT_DELETEROW_NAME,
-    AWAIT_RENAMEROW_OLD, AWAIT_RENAMEROW_NEW,
-    AWAIT_INSERTROW_NAME, AWAIT_INSERTROW_POS, AWAIT_INSERTROW_BARCODE,
-) = range(25)
+    # add item
+    S_ADD_BARCODE, S_ADD_SHELF, S_ADD_BOX,
+    # photo
+    S_PHOTO_BARCODE, S_PHOTO_IMG,
+    # search
+    S_SEARCH,
+    # move
+    S_MOVE_BARCODE, S_MOVE_SHELF, S_MOVE_BOX,
+    # delete
+    S_DELETE_BARCODE,
+    # row management
+    S_ROW_MENU,
+    S_ADDROW_NAME, S_ADDROW_ITEMS,
+    S_APPENDROW_PICK, S_APPENDROW_ITEMS,
+    S_INSERTROW_PICK, S_INSERTROW_POS, S_INSERTROW_BARCODE,
+    S_SHOWROW_NAME,
+    S_RENAMEROW_PICK, S_RENAMEROW_NEW,
+    S_DELETEROW_PICK,
+) = range(22)
 
 # ==========================
 # DATABASE
@@ -44,1569 +56,1012 @@ os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
-cur = conn.cursor()
-
-cur.executescript("""
+conn.executescript("""
 PRAGMA journal_mode=WAL;
-
 CREATE TABLE IF NOT EXISTS stores (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT    NOT NULL UNIQUE,
-    join_code  TEXT    NOT NULL UNIQUE
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    name      TEXT NOT NULL UNIQUE,
+    join_code TEXT NOT NULL UNIQUE
 );
-
 CREATE TABLE IF NOT EXISTS users (
     tg_id    INTEGER NOT NULL,
     store_id INTEGER NOT NULL,
-    role     TEXT    NOT NULL DEFAULT 'worker',
+    role     TEXT NOT NULL DEFAULT 'worker',
     name     TEXT,
-    PRIMARY KEY (tg_id, store_id),
-    FOREIGN KEY (store_id) REFERENCES stores(id)
+    PRIMARY KEY (tg_id, store_id)
 );
-
 CREATE TABLE IF NOT EXISTS inventory (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     store_id INTEGER NOT NULL,
-    barcode  TEXT    NOT NULL,
-    row_name TEXT    NOT NULL,
-    position INTEGER NOT NULL,
+    barcode  TEXT NOT NULL,
+    shelf    TEXT NOT NULL,
+    box      INTEGER NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(store_id, barcode, row_name, position),
-    FOREIGN KEY (store_id) REFERENCES stores(id)
+    UNIQUE(store_id, barcode, shelf, box)
 );
-
 CREATE TABLE IF NOT EXISTS photos (
     store_id INTEGER NOT NULL,
-    barcode  TEXT    NOT NULL,
-    file_id  TEXT    NOT NULL,
-    PRIMARY KEY (store_id, barcode),
-    FOREIGN KEY (store_id) REFERENCES stores(id)
+    barcode  TEXT NOT NULL,
+    file_id  TEXT NOT NULL,
+    PRIMARY KEY (store_id, barcode)
 );
-
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     store_id   INTEGER NOT NULL,
     tg_id      INTEGER NOT NULL,
-    action     TEXT    NOT NULL,
+    action     TEXT NOT NULL,
     detail     TEXT,
-    created_at TEXT    DEFAULT (datetime('now'))
+    ts         TEXT DEFAULT (datetime('now'))
 );
 """)
 conn.commit()
+cur = conn.cursor()
 
 # ==========================
 # HELPERS
 # ==========================
 
-def make_join_code(name: str) -> str:
-    return hashlib.sha1(name.encode()).hexdigest()[:8].upper()
+def make_code(name): return hashlib.sha1(name.encode()).hexdigest()[:8].upper()
 
-def get_user(tg_id: int, store_id: int):
-    return cur.execute(
-        "SELECT * FROM users WHERE tg_id=? AND store_id=?", (tg_id, store_id)
-    ).fetchone()
+def get_user_store(tg_id):
+    r = cur.execute("SELECT store_id, role FROM users WHERE tg_id=? LIMIT 1", (tg_id,)).fetchone()
+    return (r["store_id"], r["role"]) if r else (None, None)
 
-def get_store_by_code(code: str):
-    return cur.execute(
-        "SELECT * FROM stores WHERE join_code=?", (code.upper().strip(),)
-    ).fetchone()
-
-def get_store_by_id(store_id: int):
+def get_store(store_id):
     return cur.execute("SELECT * FROM stores WHERE id=?", (store_id,)).fetchone()
 
-def user_store(tg_id: int):
-    """Return (store_id, role) for the user's active store, or (None, None)."""
-    row = cur.execute(
-        "SELECT store_id, role FROM users WHERE tg_id=? LIMIT 1", (tg_id,)
-    ).fetchone()
-    return (row["store_id"], row["role"]) if row else (None, None)
-
-def is_admin(tg_id: int) -> bool:
-    return tg_id == ADMIN_ID
-
-def log(store_id, tg_id, action, detail=""):
-    cur.execute(
-        "INSERT INTO audit_log (store_id, tg_id, action, detail) VALUES (?,?,?,?)",
-        (store_id, tg_id, action, detail)
-    )
-    conn.commit()
+def get_store_by_code(code):
+    return cur.execute("SELECT * FROM stores WHERE join_code=?", (code.upper().strip(),)).fetchone()
 
 def get_photo(store_id, barcode):
-    row = cur.execute(
-        "SELECT file_id FROM photos WHERE store_id=? AND barcode=?", (store_id, barcode)
-    ).fetchone()
-    return row["file_id"] if row else None
+    r = cur.execute("SELECT file_id FROM photos WHERE store_id=? AND barcode=?", (store_id, barcode)).fetchone()
+    return r["file_id"] if r else None
 
-def main_menu(role: str) -> ReplyKeyboardMarkup:
-    """Persistent bottom keyboard based on role."""
-    worker_keys = [
-        [KeyboardButton("🔍 Search"), KeyboardButton("➕ Add item")],
-        [KeyboardButton("🔀 Move product"), KeyboardButton("📷 Add photo")],
-        [KeyboardButton("🗑 Delete item"), KeyboardButton("📦 Manage rows")],
+def log(store_id, tg_id, action, detail=""):
+    cur.execute("INSERT INTO audit_log(store_id,tg_id,action,detail) VALUES(?,?,?,?)",
+                (store_id, tg_id, action, detail))
+    conn.commit()
+
+def is_admin(tg_id): return tg_id == ADMIN_ID
+
+def menu(role):
+    base = [
+        [KeyboardButton("🔍 Search"),       KeyboardButton("➕ Add item")],
+        [KeyboardButton("🔀 Move"),          KeyboardButton("📷 Add photo")],
+        [KeyboardButton("🗑 Delete"),        KeyboardButton("📦 Rows")],
         [KeyboardButton("ℹ️ Help")],
     ]
-    manager_keys = worker_keys + [
-        [KeyboardButton("📊 Audit log"), KeyboardButton("⚠️ Low stock")],
-    ]
-    keys = manager_keys if role in ("manager", "admin") else worker_keys
-    return ReplyKeyboardMarkup(keys, resize_keyboard=True)
+    if role in ("manager", "admin"):
+        base.append([KeyboardButton("📊 Audit"), KeyboardButton("⚠️ Low stock")])
+    return ReplyKeyboardMarkup(base, resize_keyboard=True)
 
-async def require_store(update: Update) -> tuple:
-    """Returns (store_id, role) or sends error and returns (None, None)."""
+async def get_ctx(update, context):
+    """Return (store_id, role) and set in user_data. Send error if not in a store."""
     tg_id = update.effective_user.id
-    if is_admin(tg_id):
-        store_id, role = user_store(tg_id)
-        if store_id:
-            return store_id, "admin"
-    store_id, role = user_store(tg_id)
+    store_id = context.user_data.get("store_id")
+    role     = context.user_data.get("role")
     if not store_id:
-        await update.message.reply_text(
-            "❌ You are not part of any store yet.\n"
-            "Use /join CODE to join a store, or ask your manager."
-        )
-        return None, None
+        store_id, role = get_user_store(tg_id)
+        if not store_id:
+            await update.effective_message.reply_text(
+                "❌ You are not in any store. Use /join CODE first."
+            )
+            return None, None
+        context.user_data["store_id"] = store_id
+        context.user_data["role"]     = role
     return store_id, role
 
 # ==========================
-# /START
+# CANCEL / FALLBACK
 # ==========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = get_user_store(update.effective_user.id)
+    context.user_data.clear()
+    if store_id:
+        context.user_data["store_id"] = store_id
+        context.user_data["role"]     = role
+    await update.message.reply_text("↩️ Cancelled.", reply_markup=menu(role or "worker"))
+    return ConversationHandler.END
+
+# ==========================
+# /start  /help
+# ==========================
+
+HELP = (
+    "👟 *Puma Depot Bot*\n\n"
+    "*🔍 Search* — find by barcode (partial OK)\n"
+    "*➕ Add item* — add barcode → shelf → box\n"
+    "*🔀 Move* — change item location\n"
+    "*📷 Add photo* — attach photo to barcode\n"
+    "*🗑 Delete* — remove an item\n"
+    "*📦 Rows* — manage shelves/rows\n\n"
+    "After searching, tap result buttons:\n"
+    "➖ Sold  ➕ Restock  🔀 Move  🗑 Delete\n\n"
+    "Manager: 📊 Audit · ⚠️ Low stock · /promote · /members\n"
+    "Admin: /newstore · /liststores"
+)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
-    store_id, role = user_store(tg_id)
-
-    if is_admin(tg_id) and not store_id:
-        await update.message.reply_text(
-            "👋 Welcome, Admin!\n\n"
-            "Create your first store with:\n`/newstore StoreName`",
-            parse_mode="Markdown"
-        )
-        return
-
+    store_id, role = get_user_store(tg_id)
     if not store_id:
-        await update.message.reply_text(
-            "👋 Welcome to *Puma Depot Bot*!\n\n"
-            "To get started, ask your manager for a join code, then send:\n"
-            "`/join CODE`",
-            parse_mode="Markdown"
-        )
+        if is_admin(tg_id):
+            await update.message.reply_text("👋 Admin! Create a store: `/newstore NAME`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("👋 Welcome! Ask your manager for a join code, then: `/join CODE`", parse_mode="Markdown")
         return
-
-    store = get_store_by_id(store_id)
+    store = get_store(store_id)
     await update.message.reply_text(
-        f"👋 Welcome back!\n🏪 Store: *{store['name']}*\n🔑 Role: *{role}*\n\n"
-        "Use the buttons below to get started.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(role)
+        f"👋 *{store['name']}* | role: *{role}*\n\nUse the buttons below.",
+        parse_mode="Markdown", reply_markup=menu(role)
     )
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _, role = get_user_store(update.effective_user.id)
+    await update.message.reply_text(HELP, parse_mode="Markdown", reply_markup=menu(role or "worker"))
+
 # ==========================
-# ADMIN — /newstore
+# ADMIN COMMANDS
 # ==========================
 
-async def newstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_newstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
-
     if not context.args:
-        await update.message.reply_text("Usage: `/newstore StoreName`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/newstore NAME`", parse_mode="Markdown")
         return
-
     name = " ".join(context.args)
-    code = make_join_code(name)
-
+    code = make_code(name)
     try:
-        cur.execute("INSERT INTO stores (name, join_code) VALUES (?,?)", (name, code))
+        cur.execute("INSERT INTO stores(name,join_code) VALUES(?,?)", (name, code))
         conn.commit()
-        store_id = cur.lastrowid
-        cur.execute(
-            "INSERT OR IGNORE INTO users (tg_id, store_id, role, name) VALUES (?,?,?,?)",
-            (ADMIN_ID, store_id, "admin", "Admin")
-        )
+        sid = cur.lastrowid
+        cur.execute("INSERT OR IGNORE INTO users(tg_id,store_id,role,name) VALUES(?,?,?,?)",
+                    (ADMIN_ID, sid, "admin", "Admin"))
         conn.commit()
         await update.message.reply_text(
-            f"✅ Store *{name}* created!\n\n"
-            f"🔑 Join code: `{code}`\n\n"
-            f"Share this code with managers/workers so they can use `/join {code}`",
+            f"✅ Store *{name}* created!\nJoin code: `{code}`\nShare: `/join {code}`",
             parse_mode="Markdown"
         )
     except sqlite3.IntegrityError:
-        await update.message.reply_text(f"⚠️ A store named *{name}* already exists.", parse_mode="Markdown")
+        await update.message.reply_text(f"⚠️ Store *{name}* already exists.", parse_mode="Markdown")
 
-# ==========================
-# ADMIN — /liststores
-# ==========================
-
-async def liststores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_liststores(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
-
-    rows = cur.execute("SELECT id, name, join_code FROM stores ORDER BY name").fetchall()
+    rows = cur.execute("SELECT id,name,join_code FROM stores ORDER BY name").fetchall()
     if not rows:
-        await update.message.reply_text("No stores yet. Use `/newstore Name`.", parse_mode="Markdown")
+        await update.message.reply_text("No stores yet.")
         return
-
-    text = "🏪 *All stores:*\n\n"
+    text = "🏪 *Stores:*\n\n"
     for r in rows:
-        count = cur.execute(
-            "SELECT COUNT(*) as c FROM users WHERE store_id=?", (r["id"],)
-        ).fetchone()["c"]
-        text += f"• *{r['name']}* — code: `{r['join_code']}` — {count} user(s)\n"
-
+        c = cur.execute("SELECT COUNT(*) FROM users WHERE store_id=?", (r["id"],)).fetchone()[0]
+        text += f"• *{r['name']}* — `{r['join_code']}` — {c} user(s)\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ==========================
-# /join
-# ==========================
-
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/join CODE`", parse_mode="Markdown")
         return
-
-    code = context.args[0]
-    store = get_store_by_code(code)
+    store = get_store_by_code(context.args[0])
     if not store:
-        await update.message.reply_text("❌ Invalid join code.")
+        await update.message.reply_text("❌ Invalid code.")
         return
-
-    tg_id   = update.effective_user.id
-    name    = update.effective_user.full_name
-    existing = get_user(tg_id, store["id"])
-
+    tg_id = update.effective_user.id
+    name  = update.effective_user.full_name
+    existing = cur.execute("SELECT role FROM users WHERE tg_id=? AND store_id=?",
+                           (tg_id, store["id"])).fetchone()
     if existing:
-        await update.message.reply_text(
-            f"⚠️ You're already in *{store['name']}* as *{existing['role']}*.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"⚠️ Already in *{store['name']}* as *{existing['role']}*.", parse_mode="Markdown")
         return
-
-    cur.execute(
-        "INSERT INTO users (tg_id, store_id, role, name) VALUES (?,?,?,?)",
-        (tg_id, store["id"], "worker", name)
-    )
+    cur.execute("INSERT INTO users(tg_id,store_id,role,name) VALUES(?,?,?,?)",
+                (tg_id, store["id"], "worker", name))
     conn.commit()
-    log(store["id"], tg_id, "join", f"{name} joined as worker")
-
+    log(store["id"], tg_id, "join", name)
     await update.message.reply_text(
-        f"✅ Joined *{store['name']}* as *worker*!\n\n"
-        f"A manager will confirm your access shortly.\n"
-        f"Use the menu below to get started.",
-        parse_mode="Markdown",
-        reply_markup=main_menu("worker")
+        f"✅ Joined *{store['name']}* as worker!\nTap a button to get started.",
+        parse_mode="Markdown", reply_markup=menu("worker")
     )
-
-    # Notify all managers of this store
-    managers = cur.execute(
-        "SELECT tg_id FROM users WHERE store_id=? AND role IN ('manager','admin')",
-        (store["id"],)
-    ).fetchall()
+    managers = cur.execute("SELECT tg_id FROM users WHERE store_id=? AND role IN ('manager','admin')",
+                           (store["id"],)).fetchall()
     for m in managers:
         try:
-            await context.bot.send_message(
-                m["tg_id"],
-                f"👤 New worker joined *{store['name']}*:\n"
-                f"Name: {name}\nID: `{tg_id}`\n\n"
-                f"To promote: `/promote {tg_id} manager`",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
+            await context.bot.send_message(m["tg_id"],
+                f"👤 *{name}* joined *{store['name']}*.\n`/promote {tg_id} manager` to promote.",
+                parse_mode="Markdown")
+        except Exception: pass
 
-# ==========================
-# /promote  (manager or admin only)
-# ==========================
-
-async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
-    store_id, role = user_store(tg_id)
-
-    if role not in ("manager", "admin") and not is_admin(tg_id):
-        await update.message.reply_text("❌ Manager or admin only.")
+    store_id, role = get_user_store(tg_id)
+    if role not in ("manager","admin") and not is_admin(tg_id):
+        await update.message.reply_text("❌ Manager/admin only.")
         return
-
     if len(context.args) != 2:
-        await update.message.reply_text(
-            "Usage: `/promote USER_ID ROLE`\nRoles: `worker` `manager`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/promote USER_ID ROLE`", parse_mode="Markdown")
         return
-
-    try:
-        target_id   = int(context.args[0])
-        target_role = context.args[1].lower()
+    try: target = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ USER_ID must be a number.")
         return
-
-    if target_role not in ("worker", "manager"):
-        await update.message.reply_text("❌ Role must be `worker` or `manager`.", parse_mode="Markdown")
+    new_role = context.args[1].lower()
+    if new_role not in ("worker","manager"):
+        await update.message.reply_text("❌ Role must be worker or manager.")
         return
-
-    target = get_user(target_id, store_id)
-    if not target:
-        await update.message.reply_text("❌ That user is not in your store.")
+    if not cur.execute("SELECT 1 FROM users WHERE tg_id=? AND store_id=?", (target, store_id)).fetchone():
+        await update.message.reply_text("❌ User not in your store.")
         return
-
-    cur.execute(
-        "UPDATE users SET role=? WHERE tg_id=? AND store_id=?",
-        (target_role, target_id, store_id)
-    )
+    cur.execute("UPDATE users SET role=? WHERE tg_id=? AND store_id=?", (new_role, target, store_id))
     conn.commit()
-    log(store_id, tg_id, "promote", f"{target_id} → {target_role}")
-
-    await update.message.reply_text(
-        f"✅ User `{target_id}` is now *{target_role}*.",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"✅ User `{target}` is now *{new_role}*.", parse_mode="Markdown")
     try:
-        await context.bot.send_message(
-            target_id,
-            f"🎉 Your role in the store has been updated to *{target_role}*!",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
+        await context.bot.send_message(target, f"🎉 Your role is now *{new_role}*!", parse_mode="Markdown")
+    except Exception: pass
 
-# ==========================
-# /members
-# ==========================
-
-async def members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
+async def cmd_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = get_user_store(update.effective_user.id)
+    if role not in ("manager","admin"):
+        await update.message.reply_text("❌ Manager/admin only.")
         return
-    if role not in ("manager", "admin"):
-        await update.message.reply_text("❌ Manager or admin only.")
-        return
-
-    rows = cur.execute(
-        "SELECT tg_id, name, role FROM users WHERE store_id=? ORDER BY role, name",
-        (store_id,)
-    ).fetchall()
-
-    store = get_store_by_id(store_id)
-    text  = f"👥 *Members of {store['name']}:*\n\n"
+    rows = cur.execute("SELECT tg_id,name,role FROM users WHERE store_id=? ORDER BY role,name",
+                       (store_id,)).fetchall()
+    store = get_store(store_id)
+    text = f"👥 *{store['name']} members:*\n\n"
+    icons = {"admin":"👑","manager":"🔑","worker":"👷"}
     for r in rows:
-        icon = "👑" if r["role"] == "admin" else ("🔑" if r["role"] == "manager" else "👷")
-        text += f"{icon} {r['name'] or 'Unknown'} — `{r['tg_id']}` — *{r['role']}*\n"
-
+        text += f"{icons.get(r['role'],'?')} {r['name'] or '?'} — `{r['tg_id']}` — *{r['role']}*\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ==========================
 # SEARCH
 # ==========================
 
-async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"]     = role
-    await update.message.reply_text("🔍 Enter barcode or partial code (e.g. `778`):", parse_mode="Markdown")
-    return AWAIT_SEARCH
+async def search_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    await update.message.reply_text("🔍 Enter barcode (or partial, e.g. `778`):", parse_mode="Markdown")
+    return S_SEARCH
 
-async def search_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.message.text.strip()
-    store_id = context.user_data.get("store_id")
-    if not store_id:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap 🔍 Search again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-
+async def search_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    q = update.message.text.strip()
     rows = cur.execute(
-        """
-        SELECT barcode, row_name, position, quantity
-        FROM inventory
-        WHERE store_id=? AND barcode LIKE ?
-        ORDER BY barcode, row_name, position
-        """,
-        (store_id, f"%{query}%")
+        "SELECT barcode,shelf,box,quantity FROM inventory WHERE store_id=? AND barcode LIKE ? ORDER BY barcode,shelf,box",
+        (store_id, f"%{q}%")
     ).fetchall()
-
     if not rows:
-        await update.message.reply_text(
-            f"❌ No results for `{query}`.",
-            parse_mode="Markdown",
-            reply_markup=main_menu(context.user_data.get("role", "worker"))
-        )
+        await update.message.reply_text(f"❌ No results for `{q}`.", parse_mode="Markdown", reply_markup=menu(role))
         return ConversationHandler.END
-
-    if len(rows) == 1:
-        await send_product_card(update, context, store_id, rows[0])
-        return ConversationHandler.END
-
-    # Multiple matches — show tappable list
-    buttons = []
-    seen    = set()
+    # unique barcodes
+    seen = {}
     for r in rows:
-        if r["barcode"] not in seen:
-            seen.add(r["barcode"])
-            buttons.append([InlineKeyboardButton(
-                r["barcode"], callback_data=f"view:{store_id}:{r['barcode']}"
-            )])
-
-    await update.message.reply_text(
-        f"🔍 Found *{len(seen)}* match(es) for `{query}` — tap to view:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return ConversationHandler.END
-
-async def send_product_card(update_or_query, context, store_id, row):
-    """Send a full product card with photo (if any) and inline action buttons."""
-    barcode  = row["barcode"]
-    location = f"📍 *{row['row_name']}* → box {row['position']}"
-    qty      = row["quantity"]
-    qty_text = f"📦 Qty: *{qty}*" + (" ⚠️ _Low stock!_" if qty <= 2 else "")
-    caption  = f"🔍 *{barcode}*\n\n{location}\n{qty_text}"
-
-    buttons = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➖ Sold",      callback_data=f"sold:{store_id}:{barcode}"),
-            InlineKeyboardButton("➕ Restocked", callback_data=f"restock:{store_id}:{barcode}"),
-        ],
-        [
-            InlineKeyboardButton("🔀 Move",   callback_data=f"move:{store_id}:{barcode}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"del:{store_id}:{barcode}:{row['row_name']}:{row['position']}"),
-        ],
-    ])
-
-    msg    = update_or_query.message if hasattr(update_or_query, "message") else update_or_query
-    photo  = get_photo(store_id, barcode)
-
-    if photo:
-        await msg.reply_photo(photo=photo, caption=caption, parse_mode="Markdown", reply_markup=buttons)
+        seen.setdefault(r["barcode"], []).append(r)
+    if len(seen) == 1:
+        barcode = list(seen.keys())[0]
+        await send_card(update.message, store_id, barcode, seen[barcode])
     else:
-        await msg.reply_text(
-            caption + "\n\n_No photo — use 📷 Add photo to attach one._",
-            parse_mode="Markdown",
-            reply_markup=buttons
+        btns = [[InlineKeyboardButton(b, callback_data=f"view:{store_id}:{b}")] for b in seen]
+        await update.message.reply_text(
+            f"🔍 *{len(seen)}* matches for `{q}` — tap one:",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns)
         )
+    return ConversationHandler.END
 
-async def view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button tap from search result list."""
-    query = update.callback_query
-    await query.answer()
-    _, store_id, barcode = query.data.split(":", 2)
+async def send_card(msg, store_id, barcode, locs):
+    loc_text = "\n".join(f"📍 *{r['shelf']}* — box *{r['box']}*  (qty: {r['quantity']})" for r in locs)
+    caption  = f"🔍 *{barcode}*\n\n{loc_text}"
+    btns = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➖ Sold",      callback_data=f"sold:{store_id}:{barcode}"),
+         InlineKeyboardButton("➕ Restock",   callback_data=f"restock:{store_id}:{barcode}")],
+        [InlineKeyboardButton("🔀 Move",      callback_data=f"move:{store_id}:{barcode}"),
+         InlineKeyboardButton("🗑 Delete",    callback_data=f"delitem:{store_id}:{barcode}")],
+    ])
+    photo = get_photo(store_id, barcode)
+    if photo:
+        await msg.reply_photo(photo=photo, caption=caption, parse_mode="Markdown", reply_markup=btns)
+    else:
+        await msg.reply_text(caption + "\n\n_No photo yet — tap 📷 Add photo_",
+                             parse_mode="Markdown", reply_markup=btns)
+
+async def cb_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _, store_id, barcode = q.data.split(":", 2)
     store_id = int(store_id)
-
-    rows = cur.execute(
-        "SELECT barcode, row_name, position, quantity FROM inventory WHERE store_id=? AND barcode=?",
+    locs = cur.execute(
+        "SELECT shelf,box,quantity FROM inventory WHERE store_id=? AND barcode=?",
         (store_id, barcode)
     ).fetchall()
-
-    if not rows:
-        await query.message.reply_text("❌ Not found.")
+    if not locs:
+        await q.message.reply_text("❌ Not found.")
         return
-
-    # If multiple locations, show each as a card
-    for r in rows:
-        await send_product_card(query, context, store_id, r)
+    await send_card(q.message, store_id, barcode, locs)
 
 # ==========================
-# INLINE ACTIONS — sold / restock / move / delete
+# INLINE ACTION CALLBACKS
 # ==========================
 
-async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    action = parts[0]
-
-    store_id = int(parts[1])
-    barcode  = parts[2]
-    tg_id    = query.from_user.id
-
-    if action == "sold":
-        cur.execute(
-            "UPDATE inventory SET quantity = MAX(0, quantity-1) WHERE store_id=? AND barcode=?",
-            (store_id, barcode)
-        )
-        conn.commit()
-        log(store_id, tg_id, "sold", barcode)
-        new_qty = cur.execute(
-            "SELECT MIN(quantity) as q FROM inventory WHERE store_id=? AND barcode=?",
-            (store_id, barcode)
-        ).fetchone()["q"]
-        await query.message.reply_text(
-            f"✅ Marked 1 sold for `{barcode}`.\n📦 Remaining: *{new_qty}*" +
-            ("\n\n⚠️ *Low stock!* Manager has been notified." if new_qty <= 2 else ""),
-            parse_mode="Markdown"
-        )
-        if new_qty <= 2:
-            await notify_managers_low_stock(context, store_id, barcode, new_qty)
-
-    elif action == "restock":
-        cur.execute(
-            "UPDATE inventory SET quantity = quantity+1 WHERE store_id=? AND barcode=?",
-            (store_id, barcode)
-        )
-        conn.commit()
-        log(store_id, tg_id, "restock", barcode)
-        new_qty = cur.execute(
-            "SELECT MIN(quantity) as q FROM inventory WHERE store_id=? AND barcode=?",
-            (store_id, barcode)
-        ).fetchone()["q"]
-        await query.message.reply_text(
-            f"✅ Restocked `{barcode}`.\n📦 Now: *{new_qty}*",
-            parse_mode="Markdown"
-        )
-
-    elif action == "del":
-        row_name = parts[3]
-        position = int(parts[4])
-        cur.execute(
-            "DELETE FROM inventory WHERE store_id=? AND barcode=? AND row_name=? AND position=?",
-            (store_id, barcode, row_name, position)
-        )
-        conn.commit()
-        log(store_id, tg_id, "delete", f"{barcode} from {row_name} pos {position}")
-        await query.message.reply_text(
-            f"🗑 Deleted `{barcode}` from *{row_name}*, position {position}.",
-            parse_mode="Markdown"
-        )
-
-async def notify_managers_low_stock(context, store_id, barcode, qty):
-    store    = get_store_by_id(store_id)
-    managers = cur.execute(
-        "SELECT tg_id FROM users WHERE store_id=? AND role IN ('manager','admin')",
-        (store_id,)
-    ).fetchall()
-    for m in managers:
-        try:
-            await context.bot.send_message(
-                m["tg_id"],
-                f"⚠️ *Low stock alert* — {store['name']}\n\n"
-                f"Barcode `{barcode}` has only *{qty}* left.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-# ==========================
-# ADD ITEM (conversation)
-# ==========================
-
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"]     = role
-    context.user_data.pop("new_barcode", None)
-    context.user_data.pop("new_shelf", None)
-    await update.message.reply_text(
-        "➕ *Step 1/3* — Enter the barcode:",
-        parse_mode="Markdown"
-    )
-    return AWAIT_ADD_BARCODE
-
-async def add_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-
-    context.user_data["new_barcode"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📦 *Step 2/3* — Shelf / row name\n(e.g. Новая_коллекция_1ряд):",
-        parse_mode="Markdown"
-    )
-    return AWAIT_ADD_ROW
-
-async def add_row_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unused but kept so the handler registration does not break."""
-    pass
-
-async def add_row_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-
-    context.user_data["new_shelf"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🔢 *Step 3/3* — Box number / index:",
-        parse_mode="Markdown"
-    )
-    return AWAIT_ADD_POSITION
-
-async def add_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap ➕ Add item again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-
-    try:
-        position = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Box number must be a number. Try again:")
-        return AWAIT_ADD_POSITION
-
-    store_id = context.user_data["store_id"]
-    barcode  = context.user_data.get("new_barcode", "")
-    shelf    = context.user_data.get("new_shelf", "")
-    tg_id    = update.effective_user.id
-
-    if not barcode or not shelf:
-        await update.message.reply_text("❌ Something went wrong. Please tap ➕ Add item and start again.")
-        return ConversationHandler.END
-
-    try:
-        cur.execute(
-            "INSERT INTO inventory (store_id, barcode, row_name, position) VALUES (?,?,?,?)",
-            (store_id, barcode, shelf, position)
-        )
-        conn.commit()
-        log(store_id, tg_id, "add", f"{barcode} -> {shelf} box {position}")
-        await update.message.reply_text(
-            f"✅ Saved!\n\n"
-            f"📦 Barcode: `{barcode}`\n"
-            f"📍 Shelf: *{shelf}*\n"
-            f"🔢 Box: *{position}*\n\n"
-            "💡 Tap 📷 Add photo to attach a product photo.",
-            parse_mode="Markdown",
-            reply_markup=main_menu(context.user_data.get("role", "worker"))
-        )
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(
-            f"⚠️ `{barcode}` already exists at *{shelf}*, box {position}.",
-            parse_mode="Markdown",
-            reply_markup=main_menu(context.user_data.get("role", "worker"))
-        )
-    context.user_data.pop("new_barcode", None)
-    context.user_data.pop("new_shelf", None)
-    return ConversationHandler.END
-
-# ==========================
-# ADD PHOTO (conversation)
-# ==========================
-
-async def photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"]     = role
-    await update.message.reply_text("📷 Enter the barcode to attach a photo to:")
-    return AWAIT_PHOTO_BARCODE
-
-async def photo_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    barcode  = update.message.text.strip()
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap 📷 Add photo again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-    store_id = context.user_data["store_id"]
-
-    exists = cur.execute(
-        "SELECT COUNT(*) as c FROM inventory WHERE store_id=? AND barcode=?",
-        (store_id, barcode)
-    ).fetchone()["c"]
-
-    if not exists:
-        await update.message.reply_text(
-            f"❌ `{barcode}` not found in inventory. Add it first with ➕ Add item.",
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-
-    context.user_data["photo_barcode"] = barcode
-    existing = get_photo(store_id, barcode)
-    note = " _(replaces existing photo)_" if existing else ""
-    await update.message.reply_text(
-        f"📷 Now send the photo for `{barcode}`{note}.",
-        parse_mode="Markdown"
-    )
-    return AWAIT_PHOTO_IMG
-
-async def photo_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id = context.user_data["store_id"]
-    barcode  = context.user_data["photo_barcode"]
-    file_id  = update.message.photo[-1].file_id
-    tg_id    = update.effective_user.id
-
-    cur.execute(
-        """
-        INSERT INTO photos (store_id, barcode, file_id) VALUES (?,?,?)
-        ON CONFLICT(store_id, barcode) DO UPDATE SET file_id=excluded.file_id
-        """,
-        (store_id, barcode, file_id)
-    )
-    conn.commit()
-    log(store_id, tg_id, "add_photo", barcode)
-
-    await update.message.reply_text(
-        f"✅ Photo saved for `{barcode}`!",
-        parse_mode="Markdown",
-        reply_markup=main_menu(context.user_data.get("role", "worker"))
-    )
-    return ConversationHandler.END
-
-# ==========================
-# MOVE PRODUCT (conversation)
-# ==========================
-
-async def move_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"]     = role
-    await update.message.reply_text("🔀 Barcode of the product to move:")
-    return AWAIT_MOVE_BARCODE
-
-async def move_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    barcode  = update.message.text.strip()
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap 🔀 Move product again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-    store_id = context.user_data["store_id"]
-
-    rows = cur.execute(
-        "SELECT row_name, position FROM inventory WHERE store_id=? AND barcode=?",
-        (store_id, barcode)
-    ).fetchall()
-
-    if not rows:
-        await update.message.reply_text(f"❌ `{barcode}` not found.", parse_mode="Markdown")
-        return ConversationHandler.END
-
-    context.user_data["move_barcode"] = barcode
-    locs = ", ".join(f"{r['row_name']} box {r['position']}" for r in rows)
-    await update.message.reply_text(
-        f"📍 Currently at: {locs}\n\nNew row name:"
-    )
-    return AWAIT_MOVE_ROW
-
-async def move_row(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["move_row"] = update.message.text.strip()
-    await update.message.reply_text("📦 New box / position number:")
-    return AWAIT_MOVE_POS
-
-async def move_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        new_pos = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Must be a number. Try again:")
-        return AWAIT_MOVE_POS
-
-    store_id = context.user_data["store_id"]
-    barcode  = context.user_data["move_barcode"]
-    new_row  = context.user_data["move_row"]
-    tg_id    = update.effective_user.id
-
-    cur.execute(
-        "UPDATE inventory SET row_name=?, position=? WHERE store_id=? AND barcode=?",
-        (new_row, new_pos, store_id, barcode)
-    )
-    conn.commit()
-    log(store_id, tg_id, "move", f"{barcode} → {new_row} pos {new_pos}")
-
-    await update.message.reply_text(
-        f"✅ Moved `{barcode}` to *{new_row}*, box {new_pos}.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(context.user_data.get("role", "worker"))
-    )
-    return ConversationHandler.END
-
-# ==========================
-# DELETE ITEM (conversation)
-# ==========================
-
-async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"]     = role
-    await update.message.reply_text("🗑 Enter the barcode to delete:")
-    return AWAIT_DELETE_BARCODE
-
-async def delete_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    barcode  = update.message.text.strip()
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(update.effective_user.id)
-        if not store_id:
-            await update.message.reply_text("❌ Session lost. Please tap 🗑 Delete item again.")
-            return ConversationHandler.END
-        context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
-    store_id = context.user_data["store_id"]
-
-    rows = cur.execute(
-        "SELECT id, row_name, position FROM inventory WHERE store_id=? AND barcode=?",
-        (store_id, barcode)
-    ).fetchall()
-
-    if not rows:
-        await update.message.reply_text(f"❌ `{barcode}` not found.", parse_mode="Markdown",
-            reply_markup=main_menu(context.user_data.get("role","worker")))
-        return ConversationHandler.END
-
-    buttons = [
-        [InlineKeyboardButton(
-            f"{r['row_name']} — box {r['position']}",
-            callback_data=f"delrow:{store_id}:{barcode}:{r['row_name']}:{r['position']}"
-        )]
-        for r in rows
-    ]
-    buttons.append([InlineKeyboardButton("🗑 Delete ALL locations", callback_data=f"delall:{store_id}:{barcode}")])
-
-    await update.message.reply_text(
-        f"Which entry to delete for `{barcode}`?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return ConversationHandler.END
-
-async def delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts    = query.data.split(":")
+async def cb_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    parts    = q.data.split(":")
     action   = parts[0]
     store_id = int(parts[1])
     barcode  = parts[2]
-    tg_id    = query.from_user.id
-    store_id_ud, role = user_store(tg_id)
+    tg_id    = q.from_user.id
+    _, role  = get_user_store(tg_id)
 
-    if action == "delrow":
-        row_name = parts[3]
-        position = int(parts[4])
-        cur.execute(
-            "DELETE FROM inventory WHERE store_id=? AND barcode=? AND row_name=? AND position=?",
-            (store_id, barcode, row_name, position)
-        )
+    if action == "sold":
+        cur.execute("UPDATE inventory SET quantity=MAX(0,quantity-1) WHERE store_id=? AND barcode=?",
+                    (store_id, barcode))
         conn.commit()
-        log(store_id, tg_id, "delete", f"{barcode} @ {row_name} pos {position}")
-        await query.message.reply_text(
-            f"🗑 Deleted `{barcode}` from *{row_name}*, box {position}.",
-            parse_mode="Markdown",
-            reply_markup=main_menu(role or "worker")
-        )
+        log(store_id, tg_id, "sold", barcode)
+        qty = cur.execute("SELECT MIN(quantity) FROM inventory WHERE store_id=? AND barcode=?",
+                          (store_id, barcode)).fetchone()[0]
+        await q.message.reply_text(f"✅ Sold 1× `{barcode}`. Remaining: *{qty}*" +
+                                   ("\n⚠️ Low stock!" if qty<=2 else ""), parse_mode="Markdown")
+        if qty<=2: await notify_low(context, store_id, barcode, qty)
 
-    elif action == "delall":
+    elif action == "restock":
+        cur.execute("UPDATE inventory SET quantity=quantity+1 WHERE store_id=? AND barcode=?",
+                    (store_id, barcode))
+        conn.commit()
+        log(store_id, tg_id, "restock", barcode)
+        qty = cur.execute("SELECT MIN(quantity) FROM inventory WHERE store_id=? AND barcode=?",
+                          (store_id, barcode)).fetchone()[0]
+        await q.message.reply_text(f"✅ Restocked `{barcode}`. Now: *{qty}*", parse_mode="Markdown")
+
+    elif action == "delitem":
         cur.execute("DELETE FROM inventory WHERE store_id=? AND barcode=?", (store_id, barcode))
         cur.execute("DELETE FROM photos WHERE store_id=? AND barcode=?", (store_id, barcode))
         conn.commit()
-        log(store_id, tg_id, "delete_all", barcode)
-        await query.message.reply_text(
-            f"🗑 Deleted all entries for `{barcode}` (including photo).",
-            parse_mode="Markdown",
-            reply_markup=main_menu(role or "worker")
+        log(store_id, tg_id, "delete", barcode)
+        await q.message.reply_text(f"🗑 Deleted `{barcode}`.", parse_mode="Markdown",
+                                   reply_markup=menu(role or "worker"))
+
+    elif action == "move":
+        context.user_data["store_id"]     = store_id
+        context.user_data["role"]         = role or "worker"
+        context.user_data["move_barcode"] = barcode
+        await q.message.reply_text(f"🔀 Moving `{barcode}`.\n\nNew shelf name:", parse_mode="Markdown")
+        # We can't return a state from a callback — use user_data flag instead
+        context.user_data["awaiting_move_shelf"] = True
+
+async def notify_low(context, store_id, barcode, qty):
+    store = get_store(store_id)
+    for m in cur.execute("SELECT tg_id FROM users WHERE store_id=? AND role IN ('manager','admin')",
+                         (store_id,)).fetchall():
+        try:
+            await context.bot.send_message(m["tg_id"],
+                f"⚠️ *Low stock* — {store['name']}\n`{barcode}` has only *{qty}* left.",
+                parse_mode="Markdown")
+        except Exception: pass
+
+# ==========================
+# ADD ITEM  (3 steps)
+# ==========================
+
+async def add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    context.user_data.pop("add_barcode", None)
+    context.user_data.pop("add_shelf",   None)
+    await update.message.reply_text("➕ *Step 1 of 3*\nEnter the barcode:", parse_mode="Markdown")
+    return S_ADD_BARCODE
+
+async def add_got_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    context.user_data["add_barcode"] = update.message.text.strip()
+    await update.message.reply_text("📦 *Step 2 of 3*\nShelf / row name:", parse_mode="Markdown")
+    return S_ADD_SHELF
+
+async def add_got_shelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    context.user_data["add_shelf"] = update.message.text.strip()
+    await update.message.reply_text("🔢 *Step 3 of 3*\nBox number:", parse_mode="Markdown")
+    return S_ADD_BOX
+
+async def add_got_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    try:
+        box = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Box number must be a number. Try again:")
+        return S_ADD_BOX
+    barcode = context.user_data.get("add_barcode","")
+    shelf   = context.user_data.get("add_shelf","")
+    if not barcode or not shelf:
+        await update.message.reply_text("❌ Something went wrong. Please tap ➕ Add item and start again.")
+        return ConversationHandler.END
+    try:
+        cur.execute("INSERT INTO inventory(store_id,barcode,shelf,box) VALUES(?,?,?,?)",
+                    (store_id, barcode, shelf, box))
+        conn.commit()
+        log(store_id, update.effective_user.id, "add", f"{barcode} @ {shelf} box {box}")
+        await update.message.reply_text(
+            f"✅ *Saved!*\n\n📦 `{barcode}`\n📍 {shelf}\n🔢 Box {box}",
+            parse_mode="Markdown", reply_markup=menu(role)
         )
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(
+            f"⚠️ `{barcode}` already exists at *{shelf}* box {box}.",
+            parse_mode="Markdown", reply_markup=menu(role)
+        )
+    context.user_data.pop("add_barcode", None)
+    context.user_data.pop("add_shelf",   None)
+    return ConversationHandler.END
 
 # ==========================
-# SHOW ROWS
+# ADD PHOTO  (2 steps)
 # ==========================
 
-async def show_rows(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return
+async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    await update.message.reply_text("📷 Enter the barcode to attach a photo to:")
+    return S_PHOTO_BARCODE
 
-    rows = cur.execute(
-        "SELECT row_name, COUNT(*) as total FROM inventory WHERE store_id=? GROUP BY row_name ORDER BY row_name",
-        (store_id,)
-    ).fetchall()
+async def photo_got_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    barcode = update.message.text.strip()
+    if not cur.execute("SELECT 1 FROM inventory WHERE store_id=? AND barcode=?",
+                       (store_id, barcode)).fetchone():
+        await update.message.reply_text(f"❌ `{barcode}` not in inventory.", parse_mode="Markdown",
+                                        reply_markup=menu(role))
+        return ConversationHandler.END
+    context.user_data["photo_barcode"] = barcode
+    existing = get_photo(store_id, barcode)
+    await update.message.reply_text(
+        f"📷 Now send the photo for `{barcode}`" + (" _(replaces existing)_" if existing else "") + ":",
+        parse_mode="Markdown"
+    )
+    return S_PHOTO_IMG
 
-    if not rows:
-        await update.message.reply_text("📭 No rows yet.", reply_markup=main_menu(role))
-        return
-
-    store = get_store_by_id(store_id)
-    text  = f"📋 *{store['name']} — all rows:*\n\n"
-    for r in rows:
-        text += f"• *{r['row_name']}* — {r['total']} item(s)\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu(role))
-
-# ==========================
-# AUDIT LOG (manager+)
-# ==========================
-
-async def audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return
-    if role not in ("manager", "admin"):
-        await update.message.reply_text("❌ Manager or admin only.")
-        return
-
-    rows = cur.execute(
-        """
-        SELECT action, detail, tg_id, created_at
-        FROM audit_log
-        WHERE store_id=?
-        ORDER BY id DESC LIMIT 20
-        """,
-        (store_id,)
-    ).fetchall()
-
-    if not rows:
-        await update.message.reply_text("📋 No activity yet.")
-        return
-
-    store = get_store_by_id(store_id)
-    text  = f"📋 *{store['name']} — last 20 actions:*\n\n"
-    for r in rows:
-        text += f"`{r['created_at'][:16]}` — {r['action']} — {r['detail']} (by `{r['tg_id']}`)\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
+async def photo_got_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    barcode = context.user_data.get("photo_barcode","")
+    file_id = update.message.photo[-1].file_id
+    cur.execute("INSERT INTO photos(store_id,barcode,file_id) VALUES(?,?,?) "
+                "ON CONFLICT(store_id,barcode) DO UPDATE SET file_id=excluded.file_id",
+                (store_id, barcode, file_id))
+    conn.commit()
+    log(store_id, update.effective_user.id, "photo", barcode)
+    await update.message.reply_text(f"✅ Photo saved for `{barcode}`!", parse_mode="Markdown",
+                                    reply_markup=menu(role))
+    return ConversationHandler.END
 
 # ==========================
-# LOW STOCK (manager+)
+# MOVE  (2 steps via conversation)
 # ==========================
 
-async def low_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return
-    if role not in ("manager", "admin"):
-        await update.message.reply_text("❌ Manager or admin only.")
-        return
+async def move_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    await update.message.reply_text("🔀 Enter the barcode to move:")
+    return S_MOVE_BARCODE
 
-    rows = cur.execute(
-        """
-        SELECT barcode, row_name, position, quantity
-        FROM inventory
-        WHERE store_id=? AND quantity <= 2
-        ORDER BY quantity, barcode
-        """,
-        (store_id,)
-    ).fetchall()
+async def move_got_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    barcode = update.message.text.strip()
+    locs = cur.execute("SELECT shelf,box FROM inventory WHERE store_id=? AND barcode=?",
+                       (store_id, barcode)).fetchall()
+    if not locs:
+        await update.message.reply_text(f"❌ `{barcode}` not found.", parse_mode="Markdown",
+                                        reply_markup=menu(role))
+        return ConversationHandler.END
+    context.user_data["move_barcode"] = barcode
+    loc_text = ", ".join(f"{r['shelf']} box {r['box']}" for r in locs)
+    await update.message.reply_text(f"📍 Currently: {loc_text}\n\nNew shelf name:")
+    return S_MOVE_SHELF
 
-    if not rows:
-        await update.message.reply_text("✅ No low stock items.")
-        return
+async def move_got_shelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    context.user_data["move_shelf"] = update.message.text.strip()
+    await update.message.reply_text("🔢 New box number:")
+    return S_MOVE_BOX
 
-    store = get_store_by_id(store_id)
-    text  = f"⚠️ *{store['name']} — low stock:*\n\n"
-    for r in rows:
-        text += f"• `{r['barcode']}` — {r['row_name']} box {r['position']} — *{r['quantity']}* left\n"
+async def move_got_box(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    try:
+        box = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Must be a number. Try again:")
+        return S_MOVE_BOX
+    barcode = context.user_data.get("move_barcode","")
+    shelf   = context.user_data.get("move_shelf","")
+    cur.execute("UPDATE inventory SET shelf=?,box=? WHERE store_id=? AND barcode=?",
+                (shelf, box, store_id, barcode))
+    conn.commit()
+    log(store_id, update.effective_user.id, "move", f"{barcode} -> {shelf} box {box}")
+    await update.message.reply_text(f"✅ Moved `{barcode}` to *{shelf}*, box {box}.",
+                                    parse_mode="Markdown", reply_markup=menu(role))
+    return ConversationHandler.END
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+# ==========================
+# DELETE  (1 step)
+# ==========================
 
+async def delete_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    await update.message.reply_text("🗑 Enter the barcode to delete:")
+    return S_DELETE_BARCODE
+
+async def delete_got_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    barcode = update.message.text.strip()
+    locs = cur.execute("SELECT shelf,box FROM inventory WHERE store_id=? AND barcode=?",
+                       (store_id, barcode)).fetchall()
+    if not locs:
+        await update.message.reply_text(f"❌ `{barcode}` not found.", parse_mode="Markdown",
+                                        reply_markup=menu(role))
+        return ConversationHandler.END
+    btns = [
+        [InlineKeyboardButton(f"{r['shelf']} box {r['box']}",
+                              callback_data=f"delone:{store_id}:{barcode}:{r['shelf']}:{r['box']}")]
+        for r in locs
+    ]
+    btns.append([InlineKeyboardButton("🗑 Delete ALL", callback_data=f"delall:{store_id}:{barcode}")])
+    await update.message.reply_text(f"Which entry to delete for `{barcode}`?",
+                                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    return ConversationHandler.END
+
+async def cb_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    parts    = q.data.split(":")
+    action   = parts[0]
+    store_id = int(parts[1])
+    barcode  = parts[2]
+    tg_id    = q.from_user.id
+    _, role  = get_user_store(tg_id)
+    if action == "delone":
+        shelf = parts[3]; box = int(parts[4])
+        cur.execute("DELETE FROM inventory WHERE store_id=? AND barcode=? AND shelf=? AND box=?",
+                    (store_id, barcode, shelf, box))
+        conn.commit()
+        log(store_id, tg_id, "delone", f"{barcode} @ {shelf} box {box}")
+        await q.message.reply_text(f"🗑 Deleted `{barcode}` from *{shelf}* box {box}.",
+                                   parse_mode="Markdown", reply_markup=menu(role or "worker"))
+    elif action == "delall":
+        cur.execute("DELETE FROM inventory WHERE store_id=? AND barcode=?", (store_id, barcode))
+        cur.execute("DELETE FROM photos WHERE store_id=? AND barcode=?",    (store_id, barcode))
+        conn.commit()
+        log(store_id, tg_id, "delall", barcode)
+        await q.message.reply_text(f"🗑 Deleted all entries for `{barcode}`.",
+                                   parse_mode="Markdown", reply_markup=menu(role or "worker"))
 
 # ==========================
 # ROW MANAGEMENT
 # ==========================
 
-ROW_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📋 Show row",        callback_data="rowmgr:show")],
-    [InlineKeyboardButton("➕ Add new row",      callback_data="rowmgr:addrow")],
-    [InlineKeyboardButton("📎 Append to row",   callback_data="rowmgr:append")],
-    [InlineKeyboardButton("📌 Insert at position", callback_data="rowmgr:insert")],
-    [InlineKeyboardButton("✏️ Rename row",      callback_data="rowmgr:rename")],
-    [InlineKeyboardButton("🗑 Delete row",       callback_data="rowmgr:delete")],
+ROW_MENU_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📋 Show row",          callback_data="rm:show")],
+    [InlineKeyboardButton("➕ Add new row",        callback_data="rm:add")],
+    [InlineKeyboardButton("📎 Append to row",     callback_data="rm:append")],
+    [InlineKeyboardButton("📌 Insert at position",callback_data="rm:insert")],
+    [InlineKeyboardButton("✏️ Rename row",        callback_data="rm:rename")],
+    [InlineKeyboardButton("🗑 Delete row",         callback_data="rm:delete")],
 ])
 
-async def rowmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"]     = role
-    await update.message.reply_text("📦 *Row management* — choose an action:", parse_mode="Markdown", reply_markup=ROW_MENU)
-    return AWAIT_ROW_ACTION
+async def rows_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    await update.message.reply_text("📦 *Row management:*", parse_mode="Markdown", reply_markup=ROW_MENU_KB)
+    return S_ROW_MENU
 
-async def rowmgr_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Standalone entry for show row (called from inline button outside conversation)."""
-    store_id, role = await require_store(update)
-    if not store_id:
-        return ConversationHandler.END
-    context.user_data["store_id"] = store_id
-    context.user_data["role"] = role
-    await update.message.reply_text("📋 Which row to show? Enter row name:")
-    return AWAIT_SHOWROW_NAME
+def shelf_buttons(store_id, cb_prefix):
+    shelves = cur.execute("SELECT DISTINCT shelf FROM inventory WHERE store_id=? ORDER BY shelf",
+                          (store_id,)).fetchall()
+    return InlineKeyboardMarkup([[InlineKeyboardButton(r["shelf"], callback_data=f"{cb_prefix}:{r['shelf']}")] for r in shelves])
 
-async def rowmgr_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]
-    # Ensure store_id is set — may be missing if bot restarted
-    if "store_id" not in context.user_data:
-        store_id, role = user_store(query.from_user.id)
-        if not store_id:
-            await query.message.reply_text("❌ Session expired. Please tap the button again.")
-            return ConversationHandler.END
+async def rm_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    store_id = context.user_data.get("store_id")
+    if not store_id:
+        store_id, role = get_user_store(q.from_user.id)
         context.user_data["store_id"] = store_id
-        context.user_data["role"] = role
+        context.user_data["role"]     = role
+    action = q.data.split(":")[1]
+    context.user_data["rm_action"] = action
 
     if action == "show":
-        await query.message.reply_text("📋 Which row to show? Enter row name:")
-        context.user_data["rowmgr_action"] = "show"
-        return AWAIT_SHOWROW_NAME
+        await q.message.reply_text("📋 Type the shelf/row name to show:")
+        return S_SHOWROW_NAME
 
-    elif action == "addrow":
-        await query.message.reply_text(
-            "➕ *Add new row*\n\nEnter the row name:",
-            parse_mode="Markdown"
-        )
-        context.user_data["rowmgr_action"] = "addrow"
-        return AWAIT_ADDROW_NAME
+    elif action == "add":
+        await q.message.reply_text(
+            "➕ *New row*\nType the shelf name:", parse_mode="Markdown")
+        return S_ADDROW_NAME
 
     elif action == "append":
-        rows = cur.execute(
-            "SELECT DISTINCT row_name FROM inventory WHERE store_id=? ORDER BY row_name",
-            (context.user_data["store_id"],)
-        ).fetchall()
-        if not rows:
-            await query.message.reply_text("❌ No rows yet. Create one first with ➕ Add new row.")
+        kb = shelf_buttons(store_id, "pick_append")
+        if not kb.inline_keyboard:
+            await q.message.reply_text("❌ No shelves yet. Add items first.")
             return ConversationHandler.END
-        buttons = [[InlineKeyboardButton(r["row_name"], callback_data=f"pickrow:{r['row_name']}")] for r in rows]
-        await query.message.reply_text("📎 *Append to row* — pick a row:", parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons))
-        context.user_data["rowmgr_action"] = "append"
-        return AWAIT_APPENDROW_NAME
+        await q.message.reply_text("📎 Pick a shelf to append to:", reply_markup=kb)
+        return S_APPENDROW_PICK
 
     elif action == "insert":
-        rows = cur.execute(
-            "SELECT DISTINCT row_name FROM inventory WHERE store_id=? ORDER BY row_name",
-            (context.user_data["store_id"],)
-        ).fetchall()
-        if not rows:
-            await query.message.reply_text("❌ No rows yet.")
+        kb = shelf_buttons(store_id, "pick_insert")
+        if not kb.inline_keyboard:
+            await q.message.reply_text("❌ No shelves yet.")
             return ConversationHandler.END
-        buttons = [[InlineKeyboardButton(r["row_name"], callback_data=f"pickrow:{r['row_name']}")] for r in rows]
-        await query.message.reply_text("📌 *Insert at position* — pick a row:", parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons))
-        context.user_data["rowmgr_action"] = "insert"
-        return AWAIT_INSERTROW_NAME
+        await q.message.reply_text("📌 Pick a shelf to insert into:", reply_markup=kb)
+        return S_INSERTROW_PICK
 
     elif action == "rename":
-        rows = cur.execute(
-            "SELECT DISTINCT row_name FROM inventory WHERE store_id=? ORDER BY row_name",
-            (context.user_data["store_id"],)
-        ).fetchall()
-        if not rows:
-            await query.message.reply_text("❌ No rows yet.")
+        kb = shelf_buttons(store_id, "pick_rename")
+        if not kb.inline_keyboard:
+            await q.message.reply_text("❌ No shelves yet.")
             return ConversationHandler.END
-        buttons = [[InlineKeyboardButton(r["row_name"], callback_data=f"pickrow:{r['row_name']}")] for r in rows]
-        await query.message.reply_text("✏️ *Rename row* — pick a row:", parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons))
-        context.user_data["rowmgr_action"] = "rename"
-        return AWAIT_RENAMEROW_OLD
+        await q.message.reply_text("✏️ Pick a shelf to rename:", reply_markup=kb)
+        return S_RENAMEROW_PICK
 
     elif action == "delete":
-        rows = cur.execute(
-            "SELECT DISTINCT row_name FROM inventory WHERE store_id=? ORDER BY row_name",
-            (context.user_data["store_id"],)
-        ).fetchall()
-        if not rows:
-            await query.message.reply_text("❌ No rows yet.")
+        kb = shelf_buttons(store_id, "pick_delete")
+        if not kb.inline_keyboard:
+            await q.message.reply_text("❌ No shelves yet.")
             return ConversationHandler.END
-        buttons = [[InlineKeyboardButton(r["row_name"], callback_data=f"pickrow:{r['row_name']}")] for r in rows]
-        await query.message.reply_text("🗑 *Delete row* — pick a row:", parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons))
-        context.user_data["rowmgr_action"] = "delete"
-        return AWAIT_DELETEROW_NAME
+        await q.message.reply_text("🗑 Pick a shelf to delete:", reply_markup=kb)
+        return S_DELETEROW_PICK
 
-# ── pickrow callback (shared across sub-actions) ──
-
-async def pickrow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    row_name = query.data.split(":", 1)[1]
-    action   = context.user_data.get("rowmgr_action")
-    store_id = context.user_data["store_id"]
-
-    if action == "append":
-        context.user_data["target_row"] = row_name
-        max_pos = cur.execute(
-            "SELECT COALESCE(MAX(position),0) FROM inventory WHERE store_id=? AND row_name=?",
-            (store_id, row_name)
-        ).fetchone()[0]
-        await query.message.reply_text(
-            f"📎 Appending to *{row_name}* (currently {max_pos} positions).\n\nSend barcodes separated by spaces. Each word = next position.\nComma-separate multiple barcodes in the same position.\nExample: `111 222,223 333`",
-            parse_mode="Markdown"
-        )
-        return AWAIT_APPENDROW_ITEMS
-
-    elif action == "insert":
-        context.user_data["target_row"] = row_name
-        # Show current row so user knows positions
-        items = cur.execute(
-            "SELECT position, GROUP_CONCAT(barcode, ', ') as barcodes FROM inventory "
-            "WHERE store_id=? AND row_name=? GROUP BY position ORDER BY position",
-            (store_id, row_name)
-        ).fetchall()
-        preview = "\n".join(f"  {r['position']}. {r['barcodes']}" for r in items) if items else "  (empty)"
-        await query.message.reply_text(
-            f"📌 *{row_name}* current positions:\n{preview}\n\nAt which position to insert? (existing items shift down)",
-            parse_mode="Markdown"
-        )
-        return AWAIT_INSERTROW_POS
-
-    elif action == "rename":
-        context.user_data["target_row"] = row_name
-        await query.message.reply_text(f"✏️ New name for *{row_name}*:", parse_mode="Markdown")
-        return AWAIT_RENAMEROW_NEW
-
-    elif action == "delete":
-        count = cur.execute(
-            "SELECT COUNT(*) FROM inventory WHERE store_id=? AND row_name=?",
-            (store_id, row_name)
-        ).fetchone()[0]
-        buttons = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirmdelrow:{row_name}"),
-            InlineKeyboardButton("❌ Cancel",      callback_data="canceldelrow"),
-        ]])
-        await query.message.reply_text(
-            f"⚠️ Delete row *{row_name}* and all *{count}* item(s) in it?",
-            parse_mode="Markdown",
-            reply_markup=buttons
-        )
-        return AWAIT_DELETEROW_NAME
-
-# ── SHOW ROW ──
-
-async def showrow_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row_name = update.message.text.strip()
-    store_id = context.user_data["store_id"]
-    role     = context.user_data["role"]
-    return await _send_row(update.message, store_id, row_name, role)
-
-async def _send_row(msg, store_id, row_name, role):
-    items = cur.execute(
-        "SELECT position, GROUP_CONCAT(barcode, ', ') as barcodes FROM inventory "
-        "WHERE store_id=? AND row_name=? GROUP BY position ORDER BY position",
-        (store_id, row_name)
-    ).fetchall()
-    if not items:
-        await msg.reply_text(f"❌ Row *{row_name}* not found.", parse_mode="Markdown",
-            reply_markup=main_menu(role))
-        return ConversationHandler.END
-    text = f"📋 *{row_name}*\n\n"
-    for r in items:
-        has_photo = any(
-            get_photo(store_id, b.strip())
-            for b in r["barcodes"].split(",")
-        )
-        photo_mark = " 📷" if has_photo else ""
-        text += f"`{r['position']}.` {r['barcodes']}{photo_mark}\n"
-    text += "\n_📷 = has photo_"
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=main_menu(role))
     return ConversationHandler.END
 
-# ── ADD NEW ROW ──
+# show row
+async def rm_show_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    shelf = update.message.text.strip()
+    rows  = cur.execute(
+        "SELECT box, GROUP_CONCAT(barcode,', ') as barcodes FROM inventory "
+        "WHERE store_id=? AND shelf=? GROUP BY box ORDER BY box",
+        (store_id, shelf)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text(f"❌ Shelf *{shelf}* not found.", parse_mode="Markdown",
+                                        reply_markup=menu(role))
+        return ConversationHandler.END
+    text = f"📋 *{shelf}*\n\n"
+    for r in rows:
+        text += f"`Box {r['box']}.` {r['barcodes']}\n"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=menu(role))
+    return ConversationHandler.END
 
-async def addrow_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["target_row"] = update.message.text.strip()
+# add new row
+async def rm_addrow_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_shelf"] = update.message.text.strip()
     await update.message.reply_text(
-        "Send barcodes separated by spaces. Each word = next box position.\n"
-        "Comma-separate for multiple barcodes at the same position.\n\n"
-        "Example: `111 222,223 333`",
-        parse_mode="Markdown"
+        "Now send all barcodes separated by spaces.\n"
+        "Each word = next box. Comma = same box.\n"
+        "Example: `111 222,223 333`", parse_mode="Markdown"
     )
-    return AWAIT_ADDROW_ITEMS
+    return S_ADDROW_ITEMS
 
-async def addrow_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id = context.user_data["store_id"]
-    row_name = context.user_data["target_row"]
-    role     = context.user_data["role"]
-    tg_id    = update.effective_user.id
-    groups   = update.message.text.strip().split()
-
-    count = 0
-    skipped = 0
-    for position, group in enumerate(groups, start=1):
+async def rm_addrow_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    shelf  = context.user_data.get("new_shelf","")
+    groups = update.message.text.strip().split()
+    count  = 0
+    for box_num, group in enumerate(groups, start=1):
         for barcode in [b.strip() for b in group.split(",") if b.strip()]:
             try:
-                cur.execute(
-                    "INSERT INTO inventory (store_id, barcode, row_name, position) VALUES (?,?,?,?)",
-                    (store_id, barcode, row_name, position)
-                )
+                cur.execute("INSERT INTO inventory(store_id,barcode,shelf,box) VALUES(?,?,?,?)",
+                            (store_id, barcode, shelf, box_num))
                 count += 1
-            except sqlite3.IntegrityError:
-                skipped += 1
+            except sqlite3.IntegrityError: pass
     conn.commit()
-    log(store_id, tg_id, "addrow", f"{row_name} +{count} items")
-
-    msg = f"✅ Added *{count}* barcode(s) to new row *{row_name}*."
-    if skipped:
-        msg += f" Skipped {skipped} duplicate(s)."
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu(role))
+    log(store_id, update.effective_user.id, "addrow", f"{shelf} +{count}")
+    await update.message.reply_text(f"✅ Added *{count}* barcodes to *{shelf}*.",
+                                    parse_mode="Markdown", reply_markup=menu(role))
     return ConversationHandler.END
 
-# ── APPEND TO ROW ──
-
-async def appendrow_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id = context.user_data["store_id"]
-    row_name = context.user_data["target_row"]
-    role     = context.user_data["role"]
-    tg_id    = update.effective_user.id
-    groups   = update.message.text.strip().split()
-
-    next_pos = cur.execute(
-        "SELECT COALESCE(MAX(position),0)+1 FROM inventory WHERE store_id=? AND row_name=?",
-        (store_id, row_name)
+# append row — pick via inline button
+async def rm_append_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    shelf = q.data.split(":",1)[1]
+    context.user_data["target_shelf"] = shelf
+    max_box = cur.execute(
+        "SELECT COALESCE(MAX(box),0) FROM inventory WHERE store_id=? AND shelf=?",
+        (context.user_data["store_id"], shelf)
     ).fetchone()[0]
+    await q.message.reply_text(
+        f"📎 Appending to *{shelf}* (current max box: {max_box}).\n"
+        "Send barcodes: each word = next box, comma = same box.\n"
+        "Example: `111 222,223`", parse_mode="Markdown"
+    )
+    return S_APPENDROW_ITEMS
 
-    count = 0
-    skipped = 0
+async def rm_append_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    shelf   = context.user_data.get("target_shelf","")
+    next_box = cur.execute(
+        "SELECT COALESCE(MAX(box),0)+1 FROM inventory WHERE store_id=? AND shelf=?",
+        (store_id, shelf)
+    ).fetchone()[0]
+    groups = update.message.text.strip().split()
+    count  = 0
     for group in groups:
         for barcode in [b.strip() for b in group.split(",") if b.strip()]:
             try:
-                cur.execute(
-                    "INSERT INTO inventory (store_id, barcode, row_name, position) VALUES (?,?,?,?)",
-                    (store_id, barcode, row_name, next_pos)
-                )
+                cur.execute("INSERT INTO inventory(store_id,barcode,shelf,box) VALUES(?,?,?,?)",
+                            (store_id, barcode, shelf, next_box))
                 count += 1
-            except sqlite3.IntegrityError:
-                skipped += 1
-        next_pos += 1
+            except sqlite3.IntegrityError: pass
+        next_box += 1
     conn.commit()
-    log(store_id, tg_id, "appendrow", f"{row_name} +{count} items")
-
-    msg = f"✅ Appended *{count}* barcode(s) to *{row_name}*."
-    if skipped:
-        msg += f" Skipped {skipped} duplicate(s)."
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu(role))
+    log(store_id, update.effective_user.id, "append", f"{shelf} +{count}")
+    await update.message.reply_text(f"✅ Appended *{count}* barcodes to *{shelf}*.",
+                                    parse_mode="Markdown", reply_markup=menu(role))
     return ConversationHandler.END
 
-# ── INSERT AT POSITION ──
+# insert at position
+async def rm_insert_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    shelf = q.data.split(":",1)[1]
+    context.user_data["target_shelf"] = shelf
+    rows = cur.execute(
+        "SELECT box, GROUP_CONCAT(barcode,', ') as bc FROM inventory "
+        "WHERE store_id=? AND shelf=? GROUP BY box ORDER BY box",
+        (context.user_data["store_id"], shelf)
+    ).fetchall()
+    preview = "\n".join(f"  Box {r['box']}: {r['bc']}" for r in rows) if rows else "  (empty)"
+    await q.message.reply_text(
+        f"📌 *{shelf}*\n{preview}\n\nAt which box number to insert? (others shift down)",
+        parse_mode="Markdown"
+    )
+    return S_INSERTROW_POS
 
-async def insertrow_pos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rm_insert_pos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pos = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ Must be a number. Try again:")
-        return AWAIT_INSERTROW_POS
+        return S_INSERTROW_POS
     context.user_data["insert_pos"] = pos
     await update.message.reply_text(
-        f"📌 Inserting at position *{pos}* (items below will shift down).\n\n"
-        "Enter the barcode(s) to insert at this position (comma-separate for multiple):",
-        parse_mode="Markdown"
-    )
-    return AWAIT_INSERTROW_BARCODE
+        f"Enter barcode(s) for box {pos} (comma-separate for multiple):")
+    return S_INSERTROW_BARCODE
 
-async def insertrow_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id = context.user_data["store_id"]
-    row_name = context.user_data["target_row"]
-    pos      = context.user_data["insert_pos"]
-    role     = context.user_data["role"]
-    tg_id    = update.effective_user.id
+async def rm_insert_barcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    shelf    = context.user_data.get("target_shelf","")
+    pos      = context.user_data.get("insert_pos", 1)
     barcodes = [b.strip() for b in update.message.text.split(",") if b.strip()]
-
-    # Shift all existing items at >= pos down by 1
-    cur.execute(
-        "UPDATE inventory SET position = position + 1 WHERE store_id=? AND row_name=? AND position >= ?",
-        (store_id, row_name, pos)
-    )
-
+    cur.execute("UPDATE inventory SET box=box+1 WHERE store_id=? AND shelf=? AND box>=?",
+                (store_id, shelf, pos))
     count = 0
     for barcode in barcodes:
         try:
-            cur.execute(
-                "INSERT INTO inventory (store_id, barcode, row_name, position) VALUES (?,?,?,?)",
-                (store_id, barcode, row_name, pos)
-            )
+            cur.execute("INSERT INTO inventory(store_id,barcode,shelf,box) VALUES(?,?,?,?)",
+                        (store_id, barcode, shelf, pos))
             count += 1
-        except sqlite3.IntegrityError:
-            pass
+        except sqlite3.IntegrityError: pass
     conn.commit()
-    log(store_id, tg_id, "insert", f"{', '.join(barcodes)} → {row_name} pos {pos}")
-
+    log(store_id, update.effective_user.id, "insert", f"{shelf} box {pos} +{count}")
     await update.message.reply_text(
-        f"✅ Inserted *{count}* barcode(s) at position {pos} in *{row_name}*.\n"
-        f"All items from position {pos} downward were shifted.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(role)
+        f"✅ Inserted *{count}* barcode(s) at box {pos} in *{shelf}*. Others shifted down.",
+        parse_mode="Markdown", reply_markup=menu(role)
     )
     return ConversationHandler.END
 
-# ── RENAME ROW ──
+# rename row
+async def rm_rename_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    shelf = q.data.split(":",1)[1]
+    context.user_data["target_shelf"] = shelf
+    await q.message.reply_text(f"✏️ New name for *{shelf}*:", parse_mode="Markdown")
+    return S_RENAMEROW_NEW
 
-async def renamerow_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store_id = context.user_data["store_id"]
-    old_name = context.user_data["target_row"]
-    new_name = update.message.text.strip()
-    role     = context.user_data["role"]
-    tg_id    = update.effective_user.id
-
-    cur.execute(
-        "UPDATE inventory SET row_name=? WHERE store_id=? AND row_name=?",
-        (new_name, store_id, old_name)
-    )
+async def rm_rename_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = await get_ctx(update, context)
+    if not store_id: return ConversationHandler.END
+    old = context.user_data.get("target_shelf","")
+    new = update.message.text.strip()
+    cur.execute("UPDATE inventory SET shelf=? WHERE store_id=? AND shelf=?", (new, store_id, old))
     conn.commit()
-    log(store_id, tg_id, "rename_row", f"{old_name} -> {new_name}")
-
-    await update.message.reply_text(
-        f"✅ Renamed *{old_name}* → *{new_name}*.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(role)
-    )
+    log(store_id, update.effective_user.id, "rename", f"{old} -> {new}")
+    await update.message.reply_text(f"✅ Renamed *{old}* → *{new}*.",
+                                    parse_mode="Markdown", reply_markup=menu(role))
     return ConversationHandler.END
 
-# ── DELETE ROW confirm/cancel callbacks ──
+# delete row
+async def rm_delete_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    shelf    = q.data.split(":",1)[1]
+    store_id = context.user_data.get("store_id")
+    if not store_id:
+        store_id, _ = get_user_store(q.from_user.id)
+    count = cur.execute("SELECT COUNT(*) FROM inventory WHERE store_id=? AND shelf=?",
+                        (store_id, shelf)).fetchone()[0]
+    btns = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirmdelshelf:{store_id}:{shelf}"),
+        InlineKeyboardButton("❌ Cancel",      callback_data="canceldelshelf"),
+    ]])
+    await q.message.reply_text(
+        f"⚠️ Delete shelf *{shelf}* and all *{count}* item(s)?",
+        parse_mode="Markdown", reply_markup=btns
+    )
+    return S_DELETEROW_PICK
 
-async def confirmdelrow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.callback_query
-    await query.answer()
-    row_name = query.data.split(":", 1)[1]
-    tg_id    = query.from_user.id
-    store_id, role = user_store(tg_id)
-
-    cur.execute("DELETE FROM inventory WHERE store_id=? AND row_name=?", (store_id, row_name))
+async def cb_confirmdelshelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _, store_id, shelf = q.data.split(":", 2)
+    store_id = int(store_id)
+    tg_id    = q.from_user.id
+    _, role  = get_user_store(tg_id)
+    cur.execute("DELETE FROM inventory WHERE store_id=? AND shelf=?", (store_id, shelf))
     conn.commit()
-    log(store_id, tg_id, "delete_row", row_name)
-
-    await query.message.reply_text(
-        f"🗑 Row *{row_name}* deleted.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(role or "worker")
-    )
+    log(store_id, tg_id, "delshelf", shelf)
+    await q.message.reply_text(f"🗑 Shelf *{shelf}* deleted.", parse_mode="Markdown",
+                               reply_markup=menu(role or "worker"))
     return ConversationHandler.END
 
-async def canceldelrow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    tg_id    = query.from_user.id
-    _, role  = user_store(tg_id)
-    await query.message.reply_text("↩️ Cancelled.", reply_markup=main_menu(role or "worker"))
+async def cb_canceldelshelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _, role = get_user_store(q.from_user.id)
+    await q.message.reply_text("↩️ Cancelled.", reply_markup=menu(role or "worker"))
     return ConversationHandler.END
 
 # ==========================
-# HELP
+# MANAGER COMMANDS
 # ==========================
 
-HELP_TEXT = """
-👟 *Puma Depot Bot — Help*
+async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = get_user_store(update.effective_user.id)
+    if role not in ("manager","admin"):
+        await update.message.reply_text("❌ Manager only.")
+        return
+    rows = cur.execute(
+        "SELECT ts,action,detail,tg_id FROM audit_log WHERE store_id=? ORDER BY id DESC LIMIT 20",
+        (store_id,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text("No activity yet.")
+        return
+    text = "📋 *Last 20 actions:*\n\n"
+    for r in rows:
+        text += f"`{r['ts'][:16]}` {r['action']} — {r['detail']} (by `{r['tg_id']}`)\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-*🔍 Search* — Find by barcode (partial OK, e.g. 778)
-*➕ Add item* — Add a single barcode to a row/box
-*🔀 Move product* — Change a product's location
-*📷 Add photo* — Attach a photo to a barcode
-*🗑 Delete item* — Remove a barcode entry
+async def cmd_lowstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store_id, role = get_user_store(update.effective_user.id)
+    if role not in ("manager","admin"):
+        await update.message.reply_text("❌ Manager only.")
+        return
+    rows = cur.execute(
+        "SELECT barcode,shelf,box,quantity FROM inventory WHERE store_id=? AND quantity<=2 ORDER BY quantity,barcode",
+        (store_id,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text("✅ No low stock items.")
+        return
+    text = "⚠️ *Low stock:*\n\n"
+    for r in rows:
+        text += f"• `{r['barcode']}` — {r['shelf']} box {r['box']} — *{r['quantity']}* left\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-*📦 Manage rows:*
-• 📋 Show row — see all barcodes in a row
-• ➕ Add new row — create row with all items at once
-• 📎 Append to row — add more items to end of row
-• 📌 Insert at position — insert item, shifts others down
-• ✏️ Rename row — rename a row
-• 🗑 Delete row — delete entire row
+# ==========================
+# ERROR HANDLER
+# ==========================
 
-After searching, tap on the result to:
-• ➖ Sold — reduce quantity by 1
-• ➕ Restocked — increase quantity by 1
-• 🔀 Move — change location
-• 🗑 Delete — remove entry
-
-*Manager only:*
-• 📊 Audit log — last 20 actions
-• ⚠️ Low stock — items with ≤ 2 left
-• `/promote USER_ID ROLE` — change a user's role
-• `/members` — list store members
-
-*Admin only:*
-• `/newstore NAME` — create a new store
-• `/liststores` — list all stores
-"""
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, role = await require_store(update)
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown",
-        reply_markup=main_menu(role or "worker"))
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    logger.error("Exception: %s", "".join(traceback.format_exception(
+        type(context.error), context.error, context.error.__traceback__)))
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong. Please tap the button again.")
+        except Exception: pass
 
 # ==========================
 # KEYBOARD BUTTON ROUTER
+# (only for buttons that are NOT conversation entry points)
 # ==========================
 
 async def keyboard_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle non-conversation keyboard buttons. Conversation buttons are entry points directly."""
     text = update.message.text
-    if text == "📊 Audit log":
-        return await audit(update, context)
-    if text == "⚠️ Low stock":
-        return await low_stock(update, context)
-    if text == "ℹ️ Help":
-        return await help_cmd(update, context)
+    if text == "📊 Audit":     return await cmd_audit(update, context)
+    if text == "⚠️ Low stock": return await cmd_lowstock(update, context)
+    if text == "ℹ️ Help":      return await cmd_help(update, context)
 
 # ==========================
-# CANCEL
+# BUILD APP
 # ==========================
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, role = user_store(update.effective_user.id)
-    await update.message.reply_text(
-        "↩️ Cancelled.", reply_markup=main_menu(role or "worker")
-    )
-    return ConversationHandler.END
+ENTRY_CANCEL = [CommandHandler("cancel", cancel)]
 
-# ==========================
-# BOT SETUP
-# ==========================
-
-BUTTON_TEXTS = [
-    "🔍 Search", "➕ Add item", "🔀 Move product", "📷 Add photo",
-    "🗑 Delete item", "📦 Manage rows", "📊 Audit log", "⚠️ Low stock", "ℹ️ Help"
-]
-
-async def button_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """If user taps any main menu button mid-conversation, cancel and handle it."""
-    context.user_data.clear()
-    await keyboard_router(update, context)
-    return ConversationHandler.END
-
-def build_conv(entry_points, states, name):
-    button_fallbacks = [
-        MessageHandler(filters.Regex(f"^{re.escape(t)}$"), button_fallback)
-        for t in BUTTON_TEXTS
-    ]
+def make_conv(name, entry_text, entry_fn, states):
     return ConversationHandler(
-        entry_points=entry_points,
+        entry_points=[
+            MessageHandler(filters.Regex(f"^{re.escape(entry_text)}$"), entry_fn),
+        ],
         states=states,
-        fallbacks=[CommandHandler("cancel", cancel)] + button_fallbacks,
+        fallbacks=ENTRY_CANCEL + [
+            MessageHandler(filters.Regex(r"^(🔍 Search|➕ Add item|🔀 Move|📷 Add photo|🗑 Delete|📦 Rows|ℹ️ Help|📊 Audit|⚠️ Low stock)$"), cancel)
+        ],
         name=name,
         per_user=True,
-        per_chat=False,  # per-user only so each person has their own state
+        per_chat=False,
         allow_reentry=True,
     )
 
 app = Application.builder().token(TOKEN).build()
 
-# Commands
-app.add_handler(CommandHandler("start",      start))
-app.add_handler(CommandHandler("newstore",   newstore))
-app.add_handler(CommandHandler("liststores", liststores))
-app.add_handler(CommandHandler("join",       join))
-app.add_handler(CommandHandler("promote",    promote))
-app.add_handler(CommandHandler("members",    members))
-app.add_handler(CommandHandler("help",       help_cmd))
+# Plain commands
+app.add_handler(CommandHandler("start",      cmd_start))
+app.add_handler(CommandHandler("help",       cmd_help))
+app.add_handler(CommandHandler("newstore",   cmd_newstore))
+app.add_handler(CommandHandler("liststores", cmd_liststores))
+app.add_handler(CommandHandler("join",       cmd_join))
+app.add_handler(CommandHandler("promote",    cmd_promote))
+app.add_handler(CommandHandler("members",    cmd_members))
 
-# Callback queries
-app.add_handler(CallbackQueryHandler(view_callback,           pattern=r"^view:"))
-app.add_handler(CallbackQueryHandler(action_callback,         pattern=r"^(sold|restock):"))
-app.add_handler(CallbackQueryHandler(delete_confirm_callback, pattern=r"^(delrow|delall):"))
-app.add_handler(CallbackQueryHandler(confirmdelrow_callback,  pattern=r"^confirmdelrow:"))
-app.add_handler(CallbackQueryHandler(canceldelrow_callback,   pattern=r"^canceldelrow$"))
+# Inline callbacks
+app.add_handler(CallbackQueryHandler(cb_view,             pattern=r"^view:"))
+app.add_handler(CallbackQueryHandler(cb_action,           pattern=r"^(sold|restock|delitem|move):"))
+app.add_handler(CallbackQueryHandler(cb_delete,           pattern=r"^(delone|delall):"))
+app.add_handler(CallbackQueryHandler(cb_confirmdelshelf,  pattern=r"^confirmdelshelf:"))
+app.add_handler(CallbackQueryHandler(cb_canceldelshelf,   pattern=r"^canceldelshelf$"))
 
-# Conversations — entry points include BOTH commands AND keyboard button texts
-app.add_handler(build_conv(
-    entry_points=[
-        CommandHandler("search", search_start),
-        MessageHandler(filters.Regex(r"^🔍 Search$"), search_start),
+# Conversations — each button is its own clean conversation
+app.add_handler(make_conv("search", "🔍 Search", search_entry, {
+    S_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_run)],
+}))
+app.add_handler(make_conv("add", "➕ Add item", add_entry, {
+    S_ADD_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_got_barcode)],
+    S_ADD_SHELF:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_got_shelf)],
+    S_ADD_BOX:     [MessageHandler(filters.TEXT & ~filters.COMMAND, add_got_box)],
+}))
+app.add_handler(make_conv("photo", "📷 Add photo", photo_entry, {
+    S_PHOTO_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_got_barcode)],
+    S_PHOTO_IMG:     [MessageHandler(filters.PHOTO, photo_got_img)],
+}))
+app.add_handler(make_conv("move", "🔀 Move", move_entry, {
+    S_MOVE_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_got_barcode)],
+    S_MOVE_SHELF:   [MessageHandler(filters.TEXT & ~filters.COMMAND, move_got_shelf)],
+    S_MOVE_BOX:     [MessageHandler(filters.TEXT & ~filters.COMMAND, move_got_box)],
+}))
+app.add_handler(make_conv("delete", "🗑 Delete", delete_entry, {
+    S_DELETE_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_got_barcode)],
+}))
+app.add_handler(make_conv("rows", "📦 Rows", rows_entry, {
+    S_ROW_MENU:       [CallbackQueryHandler(rm_menu_cb, pattern=r"^rm:")],
+    S_SHOWROW_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rm_show_name)],
+    S_ADDROW_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, rm_addrow_name)],
+    S_ADDROW_ITEMS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rm_addrow_items)],
+    S_APPENDROW_PICK: [CallbackQueryHandler(rm_append_pick_cb, pattern=r"^pick_append:")],
+    S_APPENDROW_ITEMS:[MessageHandler(filters.TEXT & ~filters.COMMAND, rm_append_items)],
+    S_INSERTROW_PICK: [CallbackQueryHandler(rm_insert_pick_cb, pattern=r"^pick_insert:")],
+    S_INSERTROW_POS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, rm_insert_pos)],
+    S_INSERTROW_BARCODE:[MessageHandler(filters.TEXT & ~filters.COMMAND, rm_insert_barcode)],
+    S_RENAMEROW_PICK: [CallbackQueryHandler(rm_rename_pick_cb, pattern=r"^pick_rename:")],
+    S_RENAMEROW_NEW:  [MessageHandler(filters.TEXT & ~filters.COMMAND, rm_rename_new)],
+    S_DELETEROW_PICK: [
+        CallbackQueryHandler(rm_delete_pick_cb,   pattern=r"^pick_delete:"),
+        CallbackQueryHandler(cb_confirmdelshelf,  pattern=r"^confirmdelshelf:"),
+        CallbackQueryHandler(cb_canceldelshelf,   pattern=r"^canceldelshelf$"),
     ],
-    states={AWAIT_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_execute)]},
-    name="search"
-))
-app.add_handler(build_conv(
-    entry_points=[
-        CommandHandler("add", add_start),
-        MessageHandler(filters.Regex(r"^➕ Add item$"), add_start),
-    ],
-    states={
-        AWAIT_ADD_BARCODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_barcode)],
-        AWAIT_ADD_ROW:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_row_text)],
-        AWAIT_ADD_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_position)],
-    },
-    name="add"
-))
-app.add_handler(build_conv(
-    entry_points=[
-        CommandHandler("addphoto", photo_start),
-        MessageHandler(filters.Regex(r"^📷 Add photo$"), photo_start),
-    ],
-    states={
-        AWAIT_PHOTO_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_barcode)],
-        AWAIT_PHOTO_IMG:     [MessageHandler(filters.PHOTO, photo_receive)],
-    },
-    name="photo"
-))
-app.add_handler(build_conv(
-    entry_points=[
-        CommandHandler("move", move_start),
-        MessageHandler(filters.Regex(r"^🔀 Move product$"), move_start),
-    ],
-    states={
-        AWAIT_MOVE_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_barcode)],
-        AWAIT_MOVE_ROW:     [MessageHandler(filters.TEXT & ~filters.COMMAND, move_row)],
-        AWAIT_MOVE_POS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, move_position)],
-    },
-    name="move"
-))
-app.add_handler(build_conv(
-    entry_points=[
-        CommandHandler("delete", delete_start),
-        MessageHandler(filters.Regex(r"^🗑 Delete item$"), delete_start),
-    ],
-    states={
-        AWAIT_DELETE_BARCODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_barcode)],
-    },
-    name="delete"
-))
+}))
 
-# Row management conversation
-app.add_handler(build_conv(
-    entry_points=[
-        CommandHandler("rows", rowmgr_start),
-        MessageHandler(filters.Regex(r"^📦 Manage rows$"), rowmgr_start),
-    ],
-    states={
-        AWAIT_ROW_ACTION:      [CallbackQueryHandler(rowmgr_action,    pattern=r"^rowmgr:")],
-        AWAIT_SHOWROW_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, showrow_name)],
-        AWAIT_ADDROW_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, addrow_name)],
-        AWAIT_ADDROW_ITEMS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addrow_items)],
-        AWAIT_APPENDROW_NAME:  [CallbackQueryHandler(pickrow_callback, pattern=r"^pickrow:")],
-        AWAIT_APPENDROW_ITEMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, appendrow_items)],
-        AWAIT_INSERTROW_NAME:  [CallbackQueryHandler(pickrow_callback, pattern=r"^pickrow:")],
-        AWAIT_INSERTROW_POS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, insertrow_pos)],
-        AWAIT_INSERTROW_BARCODE:[MessageHandler(filters.TEXT & ~filters.COMMAND, insertrow_barcode)],
-        AWAIT_RENAMEROW_OLD:   [CallbackQueryHandler(pickrow_callback, pattern=r"^pickrow:")],
-        AWAIT_RENAMEROW_NEW:   [MessageHandler(filters.TEXT & ~filters.COMMAND, renamerow_new)],
-        AWAIT_DELETEROW_NAME:  [
-            CallbackQueryHandler(pickrow_callback,      pattern=r"^pickrow:"),
-            CallbackQueryHandler(confirmdelrow_callback, pattern=r"^confirmdelrow:"),
-            CallbackQueryHandler(canceldelrow_callback,  pattern=r"^canceldelrow$"),
-        ],
-    },
-    name="rowmgr"
-))
-
-# Keyboard button router (must come LAST, catches all remaining TEXT)
-app.add_handler(MessageHandler(
-    filters.TEXT & ~filters.COMMAND,
-    keyboard_router
-))
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    import traceback
-    err = ''.join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
-    print(f"ERROR: {err}")
-    # Notify user so they don't sit confused
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ Something went wrong. Please tap the button again to retry."
-            )
-        except Exception:
-            pass
+# Non-conversation keyboard buttons (audit, low stock, help)
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, keyboard_router))
 
 app.add_error_handler(error_handler)
 
-print("Puma Depot Bot running...")
+print("Puma Depot Bot v2 running...")
 app.run_polling()
